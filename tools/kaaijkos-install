@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# KaaijkOS 1.0 - Interactive TUI Installer (Ubuntu Server / Subiquity style)
+# Supports: UEFI (systemd-boot + UKI) & Legacy BIOS (GRUB i386-pc)
+#           NVMe, SATA, SCSI, VirtIO | DHCP & Static IP | GitHub SSH Key Import
+# ==============================================================================
+
+DRY_RUN=0
+[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Fout: Run kaaijkos-install als root." >&2
+    exit 1
+fi
+
+command -v dialog >/dev/null || { echo "Fout: 'dialog' is niet geinstalleerd." >&2; exit 1; }
+
+LOG_FILE="/tmp/kaaijkos-install.log"
+: > "$LOG_FILE"
+
+# Detecteer boot-modus & systeeminfo
+if [ -d /sys/firmware/efi ]; then
+    BOOT_MODE="UEFI"
+else
+    BOOT_MODE="BIOS"
+fi
+CPU_MODEL=$(awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || echo "x86_64 CPU")
+RAM_TOTAL=$(free -h | awk '/^Mem:/{print $2}')
+BACKTITLE="KaaijkOS 1.0 Installer  |  Modus: ${BOOT_MODE}  |  RAM: ${RAM_TOTAL}  |  ${CPU_MODEL}"
+[[ "$DRY_RUN" -eq 1 ]] && BACKTITLE="[TEST / DRY-RUN MODUS]  ${BACKTITLE}"
+
+# Modern Dark/Cyan KaaijkOS Dialog Theme
+export DIALOGRC="/tmp/kaaijkos-dialogrc"
+cat << 'THEME' > "$DIALOGRC"
+use_shadow = OFF
+use_colors = ON
+screen_color = (CYAN,BLACK,ON)
+dialog_color = (WHITE,BLACK,OFF)
+title_color = (CYAN,BLACK,ON)
+border_color = (CYAN,BLACK,ON)
+button_active_color = (BLACK,CYAN,ON)
+button_inactive_color = (WHITE,BLACK,OFF)
+button_key_active_color = (BLACK,CYAN,ON)
+button_key_inactive_color = (CYAN,BLACK,ON)
+button_label_active_color = (BLACK,CYAN,ON)
+button_label_inactive_color = (WHITE,BLACK,ON)
+inputbox_color = (WHITE,BLACK,OFF)
+inputbox_border_color = (CYAN,BLACK,ON)
+menubox_color = (WHITE,BLACK,OFF)
+menubox_border_color = (CYAN,BLACK,ON)
+item_color = (WHITE,BLACK,OFF)
+item_selected_color = (BLACK,CYAN,ON)
+tag_color = (CYAN,BLACK,ON)
+tag_selected_color = (BLACK,CYAN,ON)
+tag_key_color = (CYAN,BLACK,ON)
+tag_key_selected_color = (BLACK,CYAN,ON)
+check_color = (WHITE,BLACK,OFF)
+check_selected_color = (BLACK,CYAN,ON)
+gauge_color = (BLACK,CYAN,ON)
+border2_color = (CYAN,BLACK,ON)
+inputbox_border2_color = (CYAN,BLACK,ON)
+menubox_border2_color = (CYAN,BLACK,ON)
+THEME
+
+MNT="/mnt/kaaijkos-target"
+cleanup() {
+    rm -f "$DIALOGRC"
+    if [ "$DRY_RUN" -eq 0 ]; then
+        umount -R "$MNT" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+dlg() {
+    dialog --backtitle "$BACKTITLE" --stdout "$@"
+}
+
+abort_install() {
+    clear
+    echo "Installatie afgebroken door gebruiker."
+    exit 1
+}
+
+# ------------------------------------------------------------------------------
+# STAP 1: WELKOM
+# ------------------------------------------------------------------------------
+dlg --title " Welkom bij KaaijkOS 1.0 " --yes-label "Start Installatie" --no-label "Afsluiten" \
+    --yesno "\nWelkom bij de officiële KaaijkOS 1.0 Installer.\n\nGedetecteerde omgeving:\n  • Firmware / Boot : ${BOOT_MODE}\n  • Processor       : ${CPU_MODEL}\n  • Geheugen        : ${RAM_TOTAL}\n\nDeze wizard begeleidt je stap voor stap door:\n  1. Toetsenbord, taal & tijdzone\n  2. Netwerkconfiguratie (DHCP of Statisch IP)\n  3. Schijfselectie & automatische partitionering (${BOOT_MODE})\n  4. Gebruikers, wachtwoorden & SSH (incl. GitHub key import)\n\nWil je doorgaan met de installatie?" 20 74 || abort_install
+
+# ------------------------------------------------------------------------------
+# STAP 2: TOETSENBORD & LOCALE
+# ------------------------------------------------------------------------------
+KEYMAP=$(dlg --title " Stap 1/7: Toetsenbordindeling " \
+    --menu "\nKies je toetsenbordindeling:" 16 65 6 \
+    "us"        "Engels (US - Standaard)" \
+    "nl"        "Nederlands" \
+    "de"        "Duits (QWERTZ)" \
+    "be-latin1" "Belgisch (AZERTY)" \
+    "uk"        "Engels (UK)" \
+    "fr"        "Frans (AZERTY)") || abort_install
+
+loadkeys "$KEYMAP" >>"$LOG_FILE" 2>&1 || true
+
+LOCALE=$(dlg --title " Stap 2/7: Systeemtaal (Locale) " \
+    --menu "\nKies de standaard systeemtaal en regio-notatie:" 14 65 4 \
+    "en_US.UTF-8" "English (United States) - Aanbevolen voor servers" \
+    "nl_NL.UTF-8" "Nederlands (Nederland)" \
+    "nl_BE.UTF-8" "Nederlands (België)" \
+    "de_DE.UTF-8" "Deutsch (Deutschland)") || abort_install
+
+# ------------------------------------------------------------------------------
+# STAP 3: TIJDZONE
+# ------------------------------------------------------------------------------
+TIMEZONE=$(dlg --title " Stap 3/7: Tijdzone " \
+    --menu "\nKies de tijdzone voor het systeem:" 15 65 5 \
+    "Europe/Amsterdam" "Europa / Amsterdam (CET/CEST)" \
+    "Europe/Brussels"  "Europa / Brussel (CET/CEST)" \
+    "Europe/Berlin"    "Europa / Berlijn (CET/CEST)" \
+    "UTC"              "UTC (Universele Server Tijd)" \
+    "America/New_York" "Amerika / New York (EST/EDT)") || abort_install
+
+# ------------------------------------------------------------------------------
+# STAP 4: NETWERKCONFIGURATIE
+# ------------------------------------------------------------------------------
+IFACE_ITEMS=()
+while IFS= read -r line; do
+    ifname=$(echo "$line" | awk '{print $1}')
+    ifstate=$(echo "$line" | awk '{print $2}')
+    ifip=$(echo "$line" | awk '{print $3}')
+    IFACE_ITEMS+=("$ifname" "Status: ${ifstate} ${ifip:+(Huidig IP: $ifip)}")
+done < <(ip -br addr | grep -v '^lo')
+
+if [ "${#IFACE_ITEMS[@]}" -eq 0 ]; then
+    IFACE_ITEMS=("eth0" "Standaard netwerkinterface")
+fi
+
+NET_IFACE=$(dlg --title " Stap 4/7: Netwerkinterface " \
+    --menu "\nKies de primaire netwerkinterface:" 14 70 4 "${IFACE_ITEMS[@]}") || abort_install
+
+NET_MODE=$(dlg --title " Stap 4/7: Netwerkconfiguratie (${NET_IFACE}) " \
+    --menu "\nHoe moet ${NET_IFACE} geconfigureerd worden?" 13 70 2 \
+    "dhcp"   "Automatisch via DHCP (Standaard voor desktop/cloud)" \
+    "static" "Statisch IP-adres (Voor dedicated servers / Hetzner)") || abort_install
+
+STATIC_IP=""
+STATIC_GW=""
+STATIC_DNS="1.1.1.1,8.8.8.8"
+if [ "$NET_MODE" = "static" ]; then
+    STATIC_IP=$(dlg --title " Statisch IP-adres " --inputbox "\nVoer IPv4-adres + subnetmasker in (CIDR-notatie, bijv. 192.168.1.50/24):" 10 65 "192.168.1.50/24") || abort_install
+    STATIC_GW=$(dlg --title " Gateway " --inputbox "\nVoer de standaard gateway in (bijv. 192.168.1.1):" 10 65 "192.168.1.1") || abort_install
+    STATIC_DNS=$(dlg --title " DNS-servers " --inputbox "\nVoer DNS-servers in (komma-gescheiden):" 10 65 "1.1.1.1,8.8.8.8") || abort_install
+fi
+
+# ------------------------------------------------------------------------------
+# STAP 5: SCHIJFSELECTIE & SWAP
+# ------------------------------------------------------------------------------
+DISK_ITEMS=()
+while IFS= read -r line; do
+    dname="/dev/$(echo "$line" | awk '{print $1}')"
+    dsize=$(echo "$line" | awk '{print $2}')
+    dmodel=$(echo "$line" | cut -d' ' -f3-)
+    DISK_ITEMS+=("$dname" "${dsize}  -  ${dmodel:-Virtuele/Fysieke Schijf}")
+done < <(lsblk -d -n -o NAME,SIZE,MODEL -e 7,11 2>/dev/null)
+
+if [ "${#DISK_ITEMS[@]}" -eq 0 ]; then
+    dlg --title " Fout " --msgbox "\nGeen geschikte schijven gevonden!" 8 50
+    exit 1
+fi
+
+TARGET_DISK=$(dlg --title " Stap 5/7: Doelschijf kiezen (${BOOT_MODE}) " \
+    --menu "\nKies de schijf waarop KaaijkOS 1.0 geïnstalleerd moet worden.\nLET OP: Alle gegevens op de gekozen schijf worden gewist!" 16 74 5 "${DISK_ITEMS[@]}") || abort_install
+
+if dlg --title " Stap 5/7: ZRAM Geheugencompressie (Swap) " --yesno "\nWil je ZRAM-swap inschakelen?\n\n(Aanbevolen voor zowel servers als desktops: comprimeert RAM in real-time met ZSTD zonder schijfslijtage.)" 11 65; then
+    ENABLE_ZRAM="Ja"
+else
+    ENABLE_ZRAM="Nee"
+fi
+
+# ------------------------------------------------------------------------------
+# STAP 6: HOSTNAME & GEBRUIKERS
+# ------------------------------------------------------------------------------
+TARGET_HOSTNAME=$(dlg --title " Stap 6/7: Systeemnaam (Hostname) " \
+    --inputbox "\nKies een hostname voor deze machine:" 10 60 "KaaijkOS") || abort_install
+TARGET_HOSTNAME="${TARGET_HOSTNAME:-KaaijkOS}"
+
+while true; do
+    ROOT_PASS=$(dlg --title " Stap 6/7: Root-wachtwoord " --insecure --passwordbox "\nKies een wachtwoord voor de 'root' administrator:" 10 60) || abort_install
+    ROOT_PASS2=$(dlg --title " Stap 6/7: Root-wachtwoord bevestigen " --insecure --passwordbox "\nVoer het root-wachtwoord nogmaals in:" 10 60) || abort_install
+    if [ -z "$ROOT_PASS" ]; then
+        dlg --title " Fout " --msgbox "\nWachtwoord mag niet leeg zijn." 8 45
+    elif [ "$ROOT_PASS" != "$ROOT_PASS2" ]; then
+        dlg --title " Fout " --msgbox "\nWachtwoorden komen niet overeen. Probeer het opnieuw." 8 55
+    else
+        break
+    fi
+done
+
+EXTRA_USER=""
+EXTRA_PASS=""
+if dlg --title " Stap 6/7: Extra Gebruiker " --yesno "\nWil je naast 'root' ook een gewone gebruiker (met sudo-rechten) aanmaken?" 10 65; then
+    EXTRA_USER=$(dlg --title " Gebruikersnaam " --inputbox "\nKies een gebruikersnaam (kleine letters, bijv. faas):" 10 60 "") || abort_install
+    if [ -n "$EXTRA_USER" ]; then
+        while true; do
+            EXTRA_PASS=$(dlg --title " Wachtwoord voor ${EXTRA_USER} " --insecure --passwordbox "\nKies een wachtwoord voor '${EXTRA_USER}':" 10 60) || abort_install
+            EXTRA_PASS2=$(dlg --title " Bevestig wachtwoord " --insecure --passwordbox "\nVoer het wachtwoord voor '${EXTRA_USER}' nogmaals in:" 10 60) || abort_install
+            if [ -n "$EXTRA_PASS" ] && [ "$EXTRA_PASS" = "$EXTRA_PASS2" ]; then
+                break
+            fi
+            dlg --title " Fout " --msgbox "\nWachtwoorden zijn leeg of komen niet overeen." 8 55
+        done
+    fi
+fi
+
+# ------------------------------------------------------------------------------
+# STAP 7: SSH SERVER & GITHUB KEYS
+# ------------------------------------------------------------------------------
+ENABLE_SSH="Ja"
+GITHUB_USER=""
+if dlg --title " Stap 7/7: OpenSSH Server " --yesno "\nWil je de OpenSSH-server (sshd) automatisch inschakelen bij het opstarten?" 10 65; then
+    ENABLE_SSH="Ja"
+    GITHUB_USER=$(dlg --title " Stap 7/7: SSH Keys importeren van GitHub (Optioneel) " \
+        --inputbox "\nVoer je GitHub-gebruikersnaam in om je publieke SSH-keys automatisch in te stellen (of laat leeg om over te slaan):" 11 68 "") || abort_install
+else
+    ENABLE_SSH="Nee"
+fi
+
+# ------------------------------------------------------------------------------
+# STAP 8: SAMENVATTING & BEVESTIGING
+# ------------------------------------------------------------------------------
+SUMMARY="\nControleer je keuzes voordat de schijf wordt geformatteerd:\n
+  • Boot-modus     : ${BOOT_MODE} ($([ "$BOOT_MODE" = "UEFI" ] && echo "GPT + systemd-boot UKI" || echo "GPT + GRUB Legacy BIOS"))
+  • Doelschijf     : ${TARGET_DISK} (WORDT VOLLEDIG GEWIST!)
+  • ZRAM Swap      : ${ENABLE_ZRAM}
+  • Hostname       : ${TARGET_HOSTNAME}
+  • Toetsenbord    : ${KEYMAP}  |  Locale: ${LOCALE}
+  • Tijdzone       : ${TIMEZONE}
+  • Netwerk        : ${NET_IFACE} (${NET_MODE^^}${STATIC_IP:+ -> $STATIC_IP})
+  • Extra user     : ${EXTRA_USER:-Geen (alleen root)}
+  • OpenSSH Server : ${ENABLE_SSH} ${GITHUB_USER:+(GitHub keys: $GITHUB_USER)}\n"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    SUMMARY="${SUMMARY}\n[DRY-RUN ACTIEF: Er wordt NIETS naar ${TARGET_DISK} geschreven!]"
+fi
+
+dlg --title " Installatie Bevestigen " --yes-label "Nu Installeren" --no-label "Annuleren" \
+    --yesno "$SUMMARY" 22 76 || abort_install
+
+# ------------------------------------------------------------------------------
+# STAP 9: UITVOERING MET VOORTGANGSBALK
+# ------------------------------------------------------------------------------
+if [ "$DRY_RUN" -eq 1 ]; then
+    {
+        echo 15; echo "XXX"; echo "15% - [DRY-RUN] Schijf ${TARGET_DISK} partitioneren (${BOOT_MODE})..."; echo "XXX"; sleep 1
+        echo 40; echo "XXX"; echo "40% - [DRY-RUN] KaaijkOS 1.0 basissysteem installeren..."; echo "XXX"; sleep 1
+        echo 70; echo "XXX"; echo "70% - [DRY-RUN] Netwerk, locale, tijdzone & gebruikers configureren..."; echo "XXX"; sleep 1
+        echo 90; echo "XXX"; echo "90% - [DRY-RUN] Bootloader (${BOOT_MODE}) & initramfs opbouwen..."; echo "XXX"; sleep 1
+        echo 100; echo "XXX"; echo "100% - [DRY-RUN] Test succesvol afgerond!"; echo "XXX"; sleep 1
+    } | dlg --title " KaaijkOS 1.0 Installeren (DRY-RUN) " --gauge "\nBezig met voorbereiden..." 10 70 0
+
+    dlg --title " Dry-Run Voltooid! " --msgbox "\nDe TUI-installer werkt 100% naar behoren!\n\nOmdat --dry-run actief was, is er geen enkele schijf aangepast." 10 65
+    clear
+    exit 0
+fi
+
+# Bepaal partitienamen (bijv. /dev/sda1 vs /dev/nvme0n1p1)
+if [[ "$TARGET_DISK" =~ [0-9]$ ]]; then
+    P_PRE="${TARGET_DISK}p"
+else
+    P_PRE="${TARGET_DISK}"
+fi
+
+{
+    echo 5; echo "XXX"; echo "5% - Schijf ${TARGET_DISK} partitioneren voor ${BOOT_MODE}..."; echo "XXX"
+    wipefs -af "$TARGET_DISK" >>"$LOG_FILE" 2>&1
+    if [ "$BOOT_MODE" = "UEFI" ]; then
+        sfdisk "$TARGET_DISK" >>"$LOG_FILE" 2>&1 << 'PARTS'
+label: gpt
+size=512M, type=U
+type=L
+PARTS
+        BOOT_PART="${P_PRE}1"
+        ROOT_PART="${P_PRE}2"
+        partprobe "$TARGET_DISK" >>"$LOG_FILE" 2>&1 || true
+        sleep 1
+        mkfs.fat -F32 "$BOOT_PART" >>"$LOG_FILE" 2>&1
+        mkfs.ext4 -F "$ROOT_PART" >>"$LOG_FILE" 2>&1
+    else
+        # Legacy BIOS op GPT: 2M BIOS Boot Partition + ext4 Root
+        sfdisk "$TARGET_DISK" >>"$LOG_FILE" 2>&1 << 'PARTS'
+label: gpt
+size=2M, type=21686148-6449-6E6F-744E-656564454649
+type=L
+PARTS
+        BOOT_PART=""
+        ROOT_PART="${P_PRE}2"
+        partprobe "$TARGET_DISK" >>"$LOG_FILE" 2>&1 || true
+        sleep 1
+        mkfs.ext4 -F "$ROOT_PART" >>"$LOG_FILE" 2>&1
+    fi
+
+    echo 20; echo "XXX"; echo "20% - Partities mounten & KaaijkOS systeem kopiëren..."; echo "XXX"
+    mkdir -p "$MNT"
+    mount "$ROOT_PART" "$MNT"
+    if [ -n "$BOOT_PART" ]; then
+        mkdir -p "$MNT/boot"
+        mount "$BOOT_PART" "$MNT/boot"
+    fi
+
+    if [ -f /root/KaaijkOS-1.0-base-rootfs.tar.zst ]; then
+        tar -C "$MNT" --zstd -xpf /root/KaaijkOS-1.0-base-rootfs.tar.zst >>"$LOG_FILE" 2>&1
+    else
+        tar --one-file-system \
+            --exclude=/proc/* --exclude=/sys/* --exclude=/dev/* \
+            --exclude=/tmp/* --exclude=/run/* --exclude=/mnt/* \
+            --exclude=/etc/ssh/ssh_host_* --exclude=/etc/machine-id \
+            -cf - / | tar -C "$MNT" -xpf - >>"$LOG_FILE" 2>&1
+    fi
+    mkdir -p "$MNT"/{proc,sys,dev,tmp,run,mnt,boot}
+
+    echo 55; echo "XXX"; echo "55% - Systeemconfiguratie, tijdzone, locale & fstab instellen..."; echo "XXX"
+    ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+    ROOT_PARTUUID=$(blkid -s PARTUUID -o value "$ROOT_PART")
+    echo "UUID=${ROOT_UUID}  /  ext4  rw,relatime  0 1" > "$MNT/etc/fstab"
+    if [ -n "$BOOT_PART" ]; then
+        BOOT_UUID=$(blkid -s UUID -o value "$BOOT_PART")
+        echo "UUID=${BOOT_UUID}  /boot  vfat  rw,relatime,fmask=0077,dmask=0077  0 2" >> "$MNT/etc/fstab"
+    fi
+
+    echo "$TARGET_HOSTNAME" > "$MNT/etc/hostname"
+    echo "KEYMAP=${KEYMAP}" > "$MNT/etc/vconsole.conf"
+    echo "LANG=${LOCALE}" > "$MNT/etc/locale.conf"
+    sed -i "s/^#${LOCALE}/${LOCALE}/" "$MNT/etc/locale.gen" 2>/dev/null || true
+    ln -sf "/usr/share/zoneinfo/${TIMEZONE}" "$MNT/etc/localtime"
+
+    if [ "$ENABLE_ZRAM" = "Nee" ]; then
+        rm -f "$MNT/etc/systemd/zram-generator.conf"
+    else
+        printf "[zram0]\nzram-size = ram / 2\ncompression-algorithm = zstd\n" > "$MNT/etc/systemd/zram-generator.conf"
+    fi
+
+    if [ "$NET_MODE" = "static" ]; then
+        mkdir -p "$MNT/etc/NetworkManager/system-connections"
+        cat << NMCONF > "$MNT/etc/NetworkManager/system-connections/${NET_IFACE}.nmconnection"
+[connection]
+id=${NET_IFACE}
+type=ethernet
+interface-name=${NET_IFACE}
+autoconnect=true
+
+[ipv4]
+method=manual
+address1=${STATIC_IP},${STATIC_GW}
+dns=${STATIC_DNS/,/;};
+
+[ipv6]
+method=auto
+NMCONF
+        chmod 600 "$MNT/etc/NetworkManager/system-connections/${NET_IFACE}.nmconnection"
+    fi
+
+    echo 75; echo "XXX"; echo "75% - Gebruikers, wachtwoorden & SSH-server configureren..."; echo "XXX"
+    mount --types proc /proc "$MNT/proc"
+    mount --rbind /sys "$MNT/sys"
+    mount --rbind /dev "$MNT/dev"
+
+    chroot "$MNT" locale-gen >>"$LOG_FILE" 2>&1 || true
+    chroot "$MNT" pwconv >>"$LOG_FILE" 2>&1
+    chroot "$MNT" grpconv >>"$LOG_FILE" 2>&1
+    echo "root:${ROOT_PASS}" | chroot "$MNT" chpasswd
+
+    if [ -n "$EXTRA_USER" ]; then
+        chroot "$MNT" useradd -m -G wheel -s /bin/bash "$EXTRA_USER" >>"$LOG_FILE" 2>&1 || true
+        echo "${EXTRA_USER}:${EXTRA_PASS}" | chroot "$MNT" chpasswd
+        mkdir -p "$MNT/etc/sudoers.d"
+        echo "%wheel ALL=(ALL:ALL) ALL" > "$MNT/etc/sudoers.d/wheel"
+        chmod 440 "$MNT/etc/sudoers.d/wheel"
+    fi
+
+    chroot "$MNT" ssh-keygen -A >>"$LOG_FILE" 2>&1
+    chroot "$MNT" systemd-machine-id-setup >>"$LOG_FILE" 2>&1
+
+    if [ "$ENABLE_SSH" = "Ja" ]; then
+        chroot "$MNT" systemctl enable sshd.service >>"$LOG_FILE" 2>&1 || true
+    else
+        chroot "$MNT" systemctl disable sshd.service >>"$LOG_FILE" 2>&1 || true
+    fi
+
+    if [ -n "$GITHUB_USER" ]; then
+        mkdir -p "$MNT/root/.ssh"
+        curl -fsSL "https://github.com/${GITHUB_USER}.keys" >> "$MNT/root/.ssh/authorized_keys" 2>>"$LOG_FILE" || true
+        chmod 700 "$MNT/root/.ssh"
+        chmod 600 "$MNT/root/.ssh/authorized_keys" 2>/dev/null || true
+        if [ -n "$EXTRA_USER" ] && [ -d "$MNT/home/$EXTRA_USER" ]; then
+            cp -r "$MNT/root/.ssh" "$MNT/home/$EXTRA_USER/.ssh"
+            chroot "$MNT" chown -R "${EXTRA_USER}:${EXTRA_USER}" "/home/${EXTRA_USER}/.ssh"
+        fi
+    fi
+
+    echo 90; echo "XXX"; echo "90% - Bootloader (${BOOT_MODE}) & kernel image installeren..."; echo "XXX"
+    if [ "$BOOT_MODE" = "UEFI" ]; then
+        mkdir -p "$MNT/boot/loader/entries" "$MNT/boot/EFI/KaaijkOS"
+        printf "default kaaijkos.conf\ntimeout 0\nconsole-mode keep\neditor yes\n" > "$MNT/boot/loader/loader.conf"
+        cat << ENTRY > "$MNT/boot/loader/entries/kaaijkos.conf"
+title KaaijkOS 1.0
+efi /EFI/KaaijkOS/kaaijkos-kernel.efi
+options root=PARTUUID=${ROOT_PARTUUID} zswap.enabled=0 rw rootfstype=ext4 quiet vt.global_cursor_default=0 fbcon=nodefer loglevel=3 rd.udev.log_level=3 systemd.show_status=auto
+ENTRY
+        chroot "$MNT" bootctl --esp-path=/boot install --no-variables >>"$LOG_FILE" 2>&1
+        chroot "$MNT" mkinitcpio -P >>"$LOG_FILE" 2>&1
+    else
+        # Legacy BIOS: genereer losse vmlinuz + initramfs en installeer GRUB i386-pc
+        KVER=$(ls "$MNT/usr/lib/modules" | head -n 1)
+        cp "$MNT/usr/lib/modules/${KVER}/vmlinuz" "$MNT/boot/vmlinuz-kaaijkos"
+        chroot "$MNT" mkinitcpio -k "$KVER" -g /boot/initramfs-kaaijkos.img >>"$LOG_FILE" 2>&1
+        if command -v grub-install >/dev/null; then
+            grub-install --target=i386-pc --boot-directory="$MNT/boot" "$TARGET_DISK" >>"$LOG_FILE" 2>&1
+            mkdir -p "$MNT/boot/grub"
+            cat << GRUBCFG > "$MNT/boot/grub/grub.cfg"
+set default=0
+set timeout=2
+menuentry "KaaijkOS 1.0" {
+    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
+    linux /boot/vmlinuz-kaaijkos root=UUID=${ROOT_UUID} rw rootfstype=ext4 quiet loglevel=3
+    initrd /boot/initramfs-kaaijkos.img
+}
+GRUBCFG
+        fi
+    fi
+
+    echo 100; echo "XXX"; echo "100% - Installatie van KaaijkOS 1.0 voltooid!"; echo "XXX"
+    sleep 1
+} | dlg --title " KaaijkOS 1.0 Installeren " --gauge "\nStarten met installatie..." 10 72 0
+
+if dlg --title " Installatie Voltooid! " --yes-label "Nu Herstarten" --no-label "Terug naar Shell" \
+    --yesno "\nKaaijkOS 1.0 is succesvol geïnstalleerd op ${TARGET_DISK}!\n\nVerwijder na het afsluiten het installatiemedium (ISO/USB).\nWil je het systeem nu direct herstarten?" 12 68; then
+    clear
+    reboot
+fi
+clear
