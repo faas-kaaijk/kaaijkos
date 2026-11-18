@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DB_DIR="/var/lib/kpkg"
+CACHE_DIR="/var/cache/kpkg"
+mkdir -p "$DB_DIR" "$CACHE_DIR"
+
+usage() {
+    cat << 'USAGE'
+Gebruik:
+  kpkg build <src_dir> <naam> <versie>   Compileer source (CMake/Meson/Autotools/Make) -> .tar.zst
+  kpkg install <bestand.tar.zst>         Installeer package en registreer bestanden
+  kpkg remove <naam>                     Verwijder geinstalleerd package schoon
+  kpkg list                              Toon alle zelfgebouwde KaaijkOS packages
+USAGE
+    exit 1
+}
+
+cmd="${1:-}"
+case "$cmd" in
+    build)
+        [ $# -eq 4 ] || usage
+        SRC="$(realpath "$2")"
+        NAME="$3"
+        VER="$4"
+        STAGE="/tmp/kpkg-stage-${NAME}-${VER}"
+        rm -rf "$STAGE" && mkdir -p "$STAGE"
+
+        cd "$SRC"
+        if [ -f CMakeLists.txt ]; then
+            cmake -B _kpkg_build -G Ninja -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_BUILD_TYPE=Release
+            cmake --build _kpkg_build -j"$(nproc)"
+            DESTDIR="$STAGE" cmake --install _kpkg_build
+        elif [ -f meson.build ]; then
+            meson setup _kpkg_build --prefix=/usr/local --buildtype=release
+            ninja -C _kpkg_build -j"$(nproc)"
+            DESTDIR="$STAGE" ninja -C _kpkg_build install
+        elif [ -x configure ]; then
+            ./configure --prefix=/usr/local
+            make -j"$(nproc)"
+            make DESTDIR="$STAGE" install
+        elif [ -f Makefile ] || [ -f makefile ]; then
+            make -j"$(nproc)"
+            make DESTDIR="$STAGE" install PREFIX=/usr/local
+        else
+            echo "Fout: geen CMakeLists.txt, meson.build, configure of Makefile gevonden in $SRC" >&2
+            exit 1
+        fi
+
+        PKG_FILE="${CACHE_DIR}/${NAME}-${VER}.tar.zst"
+        tar -C "$STAGE" --zstd -cf "$PKG_FILE" .
+        rm -rf "$STAGE"
+        echo "Gebouwd: $PKG_FILE"
+        ;;
+    install)
+        [ $# -eq 2 ] || usage
+        PKG="$2"
+        [ -f "$PKG" ] || { echo "Bestand niet gevonden: $PKG" >&2; exit 1; }
+        BASE="$(basename "$PKG" .tar.zst)"
+        NAME="${BASE%-*}"
+        VER="${BASE##*-}"
+
+        tar -tf "$PKG" | grep -v '/$' | sed 's|^\./||' > "${DB_DIR}/${NAME}.list"
+        echo "NAME=${NAME}" > "${DB_DIR}/${NAME}.info"
+        echo "VERSION=${VER}" >> "${DB_DIR}/${NAME}.info"
+        tar -C / --zstd -xpf "$PKG"
+        ldconfig 2>/dev/null || true
+        echo "Geinstalleerd: ${NAME} (${VER})"
+        ;;
+    remove)
+        [ $# -eq 2 ] || usage
+        NAME="$2"
+        LIST="${DB_DIR}/${NAME}.list"
+        [ -f "$LIST" ] || { echo "Niet geinstalleerd: $NAME" >&2; exit 1; }
+        tac "$LIST" | while IFS= read -r f; do
+            rm -f "/$f"
+        done
+        rm -f "$LIST" "${DB_DIR}/${NAME}.info"
+        ldconfig 2>/dev/null || true
+        echo "Verwijderd: $NAME"
+        ;;
+    list)
+        for info in "${DB_DIR}"/*.info; do
+            [ -e "$info" ] || { echo "Nog geen kpkg packages geinstalleerd."; exit 0; }
+            source "$info"
+            printf "%-24s %s\n" "$NAME" "$VERSION"
+        done
+        ;;
+    *)
+        usage
+        ;;
+esac
