@@ -83,7 +83,7 @@ UUID=${BOOT_UUID}  /boot  vfat  rw,relatime  0 2
 FSTAB
 
 mkdir -p "$MNT/boot/loader/entries" "$MNT/boot/EFI/KaaijkOS"
-cp -a "$REPO_DIR/rootfs-configs/boot/loader/." "$MNT/boot/loader/"
+cp -r "$REPO_DIR/rootfs-configs/boot/loader/." "$MNT/boot/loader/"
 sed -i "s|PARTUUID=[^ ]*|PARTUUID=${ROOT_PARTUUID}|g" "$MNT/boot/loader/entries/"*.conf
 
 echo "=== 5. Accounts, SSH-keys, systemd-boot & UKI genereren ==="
