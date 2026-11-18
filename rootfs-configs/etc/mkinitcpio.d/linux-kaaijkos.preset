@@ -1,0 +1,5 @@
+ALL_config="/etc/mkinitcpio.conf"
+ALL_kver="/usr/lib/modules/7.1.8-kaaijkos/vmlinuz"
+PRESETS=('default')
+default_uki="/boot/EFI/KaaijkOS/kaaijkos-kernel.efi"
+default_options="--splash /usr/share/systemd/bootctl/splash-kaaijkos.bmp"

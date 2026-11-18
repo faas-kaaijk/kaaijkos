@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-}" in
+    install|add|i)
+        shift
+        [ $# -ge 1 ] || { echo "Gebruik: kosapps install <pakket...>"; exit 1; }
+        for p in "$@"; do
+            nix profile add "nixpkgs#${p}"
+        done
+        ;;
+    remove|rm|uninstall)
+        shift
+        [ $# -ge 1 ] || { echo "Gebruik: kosapps remove <pakket...>"; exit 1; }
+        nix profile remove "$@"
+        ;;
+    search|s)
+        shift
+        [ $# -ge 1 ] || { echo "Gebruik: kosapps search <zoekterm>"; exit 1; }
+        nix search nixpkgs "$*"
+        ;;
+    list|ls)
+        nix profile list
+        ;;
+    update|upgrade|up)
+        nix profile upgrade --all
+        ;;
+    clean)
+        nix-collect-garbage -d
+        ;;
+    *)
+        cat << 'HELP'
+KaaijkOS Apps (kosapps)
+  kosapps install <pakket...>   Installeer een of meerdere pakketten
+  kosapps remove <pakket...>    Verwijder pakketten
+  kosapps search <zoekterm>     Zoek in >100.000 pakketten
+  kosapps list                  Toon geinstalleerde pakketten
+  kosapps upgrade               Update alle pakketten
+  kosapps clean                 Ruim oude pakket-versies & cache op
+HELP
+        exit 1
+        ;;
+esac
