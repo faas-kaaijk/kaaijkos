@@ -2,36 +2,35 @@
 set -euo pipefail
 
 # ==============================================================================
-# KaaijkOS 1.0 - Interactive TUI Installer (Ubuntu Server / Subiquity style)
+# KaaijkOS 1.0 - Full Interactive System Installer (Subiquity / Ubuntu Server TUI)
 # Supports: UEFI (systemd-boot + UKI) & Legacy BIOS (GRUB i386-pc)
-#           NVMe, SATA, SCSI, VirtIO | DHCP & Static IP | GitHub SSH Key Import
+#           Guided & Custom Partitioning | Full Network Configuration
+#           All System Keymaps, Locales & Timezones | GitHub SSH Key Import
 # ==============================================================================
 
 DRY_RUN=0
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "Fout: Run kaaijkos-install als root." >&2
+    echo "Error: Please run kaaijkos-install as root." >&2
     exit 1
 fi
 
-command -v dialog >/dev/null || { echo "Fout: 'dialog' is niet geinstalleerd." >&2; exit 1; }
+command -v dialog >/dev/null || { echo "Error: 'dialog' is not installed." >&2; exit 1; }
 
 LOG_FILE="/tmp/kaaijkos-install.log"
 : > "$LOG_FILE"
 
-# Detecteer boot-modus & systeeminfo
 if [ -d /sys/firmware/efi ]; then
     BOOT_MODE="UEFI"
 else
     BOOT_MODE="BIOS"
 fi
-CPU_MODEL=$(awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || echo "x86_64 CPU")
+CPU_MODEL=$(awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || echo "x86_64 Processor")
 RAM_TOTAL=$(free -h | awk '/^Mem:/{print $2}')
-BACKTITLE="KaaijkOS 1.0 Installer  |  Modus: ${BOOT_MODE}  |  RAM: ${RAM_TOTAL}  |  ${CPU_MODEL}"
-[[ "$DRY_RUN" -eq 1 ]] && BACKTITLE="[TEST / DRY-RUN MODUS]  ${BACKTITLE}"
+BACKTITLE="KaaijkOS 1.0 Installer  |  Firmware: ${BOOT_MODE}  |  RAM: ${RAM_TOTAL}  |  ${CPU_MODEL}"
+[[ "$DRY_RUN" -eq 1 ]] && BACKTITLE="[DRY-RUN / SIMULATION]  ${BACKTITLE}"
 
-# Modern Dark/Cyan KaaijkOS Dialog Theme
 export DIALOGRC="/tmp/kaaijkos-dialogrc"
 cat << 'THEME' > "$DIALOGRC"
 use_shadow = OFF
@@ -65,8 +64,12 @@ menubox_border2_color = (CYAN,BLACK,ON)
 THEME
 
 MNT="/mnt/kaaijkos-target"
+NET_CONFIG_DIR="/tmp/kaaijkos-netconf"
+rm -rf "$NET_CONFIG_DIR" && mkdir -p "$NET_CONFIG_DIR"
+
 cleanup() {
     rm -f "$DIALOGRC"
+    rm -rf "$NET_CONFIG_DIR"
     if [ "$DRY_RUN" -eq 0 ]; then
         umount -R "$MNT" 2>/dev/null || true
     fi
@@ -79,119 +82,418 @@ dlg() {
 
 abort_install() {
     clear
-    echo "Installatie afgebroken door gebruiker."
+    echo "Installation cancelled by user."
     exit 1
 }
 
-# ------------------------------------------------------------------------------
-# STAP 1: WELKOM
-# ------------------------------------------------------------------------------
-dlg --title " Welkom bij KaaijkOS 1.0 " --yes-label "Start Installatie" --no-label "Afsluiten" \
-    --yesno "\nWelkom bij de officiële KaaijkOS 1.0 Installer.\n\nGedetecteerde omgeving:\n  • Firmware / Boot : ${BOOT_MODE}\n  • Processor       : ${CPU_MODEL}\n  • Geheugen        : ${RAM_TOTAL}\n\nDeze wizard begeleidt je stap voor stap door:\n  1. Toetsenbord, taal & tijdzone\n  2. Netwerkconfiguratie (DHCP of Statisch IP)\n  3. Schijfselectie & automatische partitionering (${BOOT_MODE})\n  4. Gebruikers, wachtwoorden & SSH (incl. GitHub key import)\n\nWil je doorgaan met de installatie?" 20 74 || abort_install
+part_prefix() {
+    local d="$1"
+    if [[ "$d" =~ [0-9]$ ]]; then echo "${d}p"; else echo "${d}"; fi
+}
 
 # ------------------------------------------------------------------------------
-# STAP 2: TOETSENBORD & LOCALE
+# 1. WELCOME
 # ------------------------------------------------------------------------------
-KEYMAP=$(dlg --title " Stap 1/7: Toetsenbordindeling " \
-    --menu "\nKies je toetsenbordindeling:" 16 65 6 \
-    "us"        "Engels (US - Standaard)" \
-    "nl"        "Nederlands" \
-    "de"        "Duits (QWERTZ)" \
-    "be-latin1" "Belgisch (AZERTY)" \
-    "uk"        "Engels (UK)" \
-    "fr"        "Frans (AZERTY)") || abort_install
+dlg --title " Welcome to KaaijkOS 1.0 " --yes-label "Continue" --no-label "Exit" \
+    --yesno "\nWelcome to the KaaijkOS 1.0 System Installer.\n\nDetected Hardware Environment:\n  • Firmware Mode : ${BOOT_MODE}\n  • Processor     : ${CPU_MODEL}\n  • System Memory : ${RAM_TOTAL}\n\nThis installer will guide you through:\n  1. Keyboard layout, system locale & timezone (full system lists)\n  2. Network configuration (IPv4/IPv6 DHCP, Static IP, DNS, Wi-Fi)\n  3. Storage configuration (Guided whole-disk or Custom manual layout)\n  4. Profile setup (Hostname, root/sudo users & GitHub SSH keys)\n\nProceed with installation?" 20 76 || abort_install
+
+# ------------------------------------------------------------------------------
+# 2. KEYBOARD LAYOUT (FULL SYSTEM LIST)
+# ------------------------------------------------------------------------------
+KEYMAP_ITEMS=(
+    "us"        "English (US) - Default"
+    "nl"        "Dutch (Netherlands)"
+    "de"        "German (Germany)"
+    "de-latin1" "German (latin1)"
+    "be-latin1" "Belgian (AZERTY)"
+    "uk"        "English (UK)"
+    "fr"        "French (AZERTY)"
+    "es"        "Spanish"
+    "it"        "Italian"
+    "pl"        "Polish"
+    "se-lat6"   "Swedish"
+)
+while IFS= read -r km; do
+    case "$km" in
+        us|nl|de|de-latin1|be-latin1|uk|fr|es|it|pl|se-lat6) continue ;;
+    esac
+    KEYMAP_ITEMS+=("$km" "Keymap ($km)")
+done < <(find /usr/share/kbd/keymaps -type f -name "*.map.gz" -printf "%f\n" 2>/dev/null | sed 's/\.map\.gz$//' | sort -u)
+
+KEYMAP=$(dlg --title " Keyboard Configuration " \
+    --menu "\nSelect your keyboard layout (use PageUp/PageDown or type to scroll):" 20 70 12 \
+    "${KEYMAP_ITEMS[@]}") || abort_install
 
 loadkeys "$KEYMAP" >>"$LOG_FILE" 2>&1 || true
 
-LOCALE=$(dlg --title " Stap 2/7: Systeemtaal (Locale) " \
-    --menu "\nKies de standaard systeemtaal en regio-notatie:" 14 65 4 \
-    "en_US.UTF-8" "English (United States) - Aanbevolen voor servers" \
-    "nl_NL.UTF-8" "Nederlands (Nederland)" \
-    "nl_BE.UTF-8" "Nederlands (België)" \
-    "de_DE.UTF-8" "Deutsch (Deutschland)") || abort_install
-
 # ------------------------------------------------------------------------------
-# STAP 3: TIJDZONE
+# 3. SYSTEM LOCALE (FULL UTF-8 LIST FROM /etc/locale.gen)
 # ------------------------------------------------------------------------------
-TIMEZONE=$(dlg --title " Stap 3/7: Tijdzone " \
-    --menu "\nKies de tijdzone voor het systeem:" 15 65 5 \
-    "Europe/Amsterdam" "Europa / Amsterdam (CET/CEST)" \
-    "Europe/Brussels"  "Europa / Brussel (CET/CEST)" \
-    "Europe/Berlin"    "Europa / Berlijn (CET/CEST)" \
-    "UTC"              "UTC (Universele Server Tijd)" \
-    "America/New_York" "Amerika / New York (EST/EDT)") || abort_install
-
-# ------------------------------------------------------------------------------
-# STAP 4: NETWERKCONFIGURATIE
-# ------------------------------------------------------------------------------
-IFACE_ITEMS=()
-while IFS= read -r line; do
-    ifname=$(echo "$line" | awk '{print $1}')
-    ifstate=$(echo "$line" | awk '{print $2}')
-    ifip=$(echo "$line" | awk '{print $3}')
-    IFACE_ITEMS+=("$ifname" "Status: ${ifstate} ${ifip:+(Huidig IP: $ifip)}")
-done < <(ip -br addr | grep -v '^lo')
-
-if [ "${#IFACE_ITEMS[@]}" -eq 0 ]; then
-    IFACE_ITEMS=("eth0" "Standaard netwerkinterface")
+LOCALE_ITEMS=(
+    "en_US.UTF-8" "English (United States) - Recommended"
+    "nl_NL.UTF-8" "Dutch (Netherlands)"
+    "nl_BE.UTF-8" "Dutch (Belgium)"
+    "en_GB.UTF-8" "English (Great Britain)"
+    "de_DE.UTF-8" "German (Germany)"
+    "fr_FR.UTF-8" "French (France)"
+)
+if [ -f /etc/locale.gen ]; then
+    while IFS= read -r loc; do
+        case "$loc" in
+            en_US.UTF-8|nl_NL.UTF-8|nl_BE.UTF-8|en_GB.UTF-8|de_DE.UTF-8|fr_FR.UTF-8) continue ;;
+        esac
+        LOCALE_ITEMS+=("$loc" "UTF-8 Locale")
+    done < <(grep -E '^#?[a-z]{2,3}_[A-Z]{2}\.UTF-8' /etc/locale.gen | sed 's/^#//; s/[[:space:]].*//' | sort -u)
 fi
 
-NET_IFACE=$(dlg --title " Stap 4/7: Netwerkinterface " \
-    --menu "\nKies de primaire netwerkinterface:" 14 70 4 "${IFACE_ITEMS[@]}") || abort_install
-
-NET_MODE=$(dlg --title " Stap 4/7: Netwerkconfiguratie (${NET_IFACE}) " \
-    --menu "\nHoe moet ${NET_IFACE} geconfigureerd worden?" 13 70 2 \
-    "dhcp"   "Automatisch via DHCP (Standaard voor desktop/cloud)" \
-    "static" "Statisch IP-adres (Voor dedicated servers / Hetzner)") || abort_install
-
-STATIC_IP=""
-STATIC_GW=""
-STATIC_DNS="1.1.1.1,8.8.8.8"
-if [ "$NET_MODE" = "static" ]; then
-    STATIC_IP=$(dlg --title " Statisch IP-adres " --inputbox "\nVoer IPv4-adres + subnetmasker in (CIDR-notatie, bijv. 192.168.1.50/24):" 10 65 "192.168.1.50/24") || abort_install
-    STATIC_GW=$(dlg --title " Gateway " --inputbox "\nVoer de standaard gateway in (bijv. 192.168.1.1):" 10 65 "192.168.1.1") || abort_install
-    STATIC_DNS=$(dlg --title " DNS-servers " --inputbox "\nVoer DNS-servers in (komma-gescheiden):" 10 65 "1.1.1.1,8.8.8.8") || abort_install
-fi
+LOCALE=$(dlg --title " System Locale " \
+    --menu "\nSelect the system language and regional encoding:" 20 70 12 \
+    "${LOCALE_ITEMS[@]}") || abort_install
 
 # ------------------------------------------------------------------------------
-# STAP 5: SCHIJFSELECTIE & SWAP
+# 4. TIMEZONE (ALL REGIONS & CITIES FROM /usr/share/zoneinfo)
 # ------------------------------------------------------------------------------
-DISK_ITEMS=()
-while IFS= read -r line; do
-    dname="/dev/$(echo "$line" | awk '{print $1}')"
-    dsize=$(echo "$line" | awk '{print $2}')
-    dmodel=$(echo "$line" | cut -d' ' -f3-)
-    DISK_ITEMS+=("$dname" "${dsize}  -  ${dmodel:-Virtuele/Fysieke Schijf}")
-done < <(lsblk -d -n -o NAME,SIZE,MODEL -e 7,11 2>/dev/null)
+while true; do
+    TZ_REGION=$(dlg --title " Timezone - Select Region " \
+        --menu "\nSelect your geographic region:" 19 65 11 \
+        "Europe"     "European Timezones" \
+        "UTC"        "Universal Coordinated Time (Servers)" \
+        "America"    "North & South America" \
+        "Asia"       "Asia & Middle East" \
+        "Africa"     "Africa" \
+        "Australia"  "Australia" \
+        "Pacific"    "Pacific Ocean & New Zealand" \
+        "Atlantic"   "Atlantic Ocean" \
+        "Indian"     "Indian Ocean" \
+        "Antarctica" "Antarctica" \
+        "Arctic"     "Arctic") || abort_install
 
-if [ "${#DISK_ITEMS[@]}" -eq 0 ]; then
-    dlg --title " Fout " --msgbox "\nGeen geschikte schijven gevonden!" 8 50
-    exit 1
-fi
+    if [ "$TZ_REGION" = "UTC" ]; then
+        TIMEZONE="UTC"
+        break
+    fi
 
-TARGET_DISK=$(dlg --title " Stap 5/7: Doelschijf kiezen (${BOOT_MODE}) " \
-    --menu "\nKies de schijf waarop KaaijkOS 1.0 geïnstalleerd moet worden.\nLET OP: Alle gegevens op de gekozen schijf worden gewist!" 16 74 5 "${DISK_ITEMS[@]}") || abort_install
+    CITY_ITEMS=()
+    while IFS= read -r city; do
+        CITY_ITEMS+=("$city" "${TZ_REGION}/${city}")
+    done < <(find "/usr/share/zoneinfo/${TZ_REGION}" -maxdepth 1 -mindepth 1 \( -type f -o -type l \) -printf "%f\n" 2>/dev/null | sort)
 
-if dlg --title " Stap 5/7: ZRAM Geheugencompressie (Swap) " --yesno "\nWil je ZRAM-swap inschakelen?\n\n(Aanbevolen voor zowel servers als desktops: comprimeert RAM in real-time met ZSTD zonder schijfslijtage.)" 11 65; then
-    ENABLE_ZRAM="Ja"
-else
-    ENABLE_ZRAM="Nee"
-fi
+    if TZ_CITY=$(dlg --title " Timezone - Select City (${TZ_REGION}) " \
+        --cancel-label "Back to Regions" \
+        --menu "\nSelect your city / timezone in ${TZ_REGION}:" 20 68 12 "${CITY_ITEMS[@]}"); then
+        TIMEZONE="${TZ_REGION}/${TZ_CITY}"
+        break
+    fi
+done
 
 # ------------------------------------------------------------------------------
-# STAP 6: HOSTNAME & GEBRUIKERS
+# 5. NETWORK CONNECTIONS (UBUNTU SERVER SUBIQUITY STYLE)
 # ------------------------------------------------------------------------------
-TARGET_HOSTNAME=$(dlg --title " Stap 6/7: Systeemnaam (Hostname) " \
-    --inputbox "\nKies een hostname voor deze machine:" 10 60 "KaaijkOS") || abort_install
+configure_interface() {
+    local iface="$1"
+    local conf_file="${NET_CONFIG_DIR}/${iface}.env"
+    local mode="dhcp"
+    local ip4="" gw4="" dns4="1.1.1.1,8.8.8.8" ip6_mode="auto" ip6_addr="" ip6_gw=""
+    [ -f "$conf_file" ] && source "$conf_file"
+
+    while true; do
+        local action
+        action=$(dlg --title " Edit Network Interface: ${iface} " \
+            --cancel-label "Back" \
+            --menu "\nCurrent settings for ${iface}:\n  • IPv4 Mode : ${mode^^} ${ip4:+($ip4, GW: $gw4)}\n  • DNS       : ${dns4}\n  • IPv6 Mode : ${ip6_mode^^} ${ip6_addr:+($ip6_addr)}\n\nChoose a setting to edit:" 18 72 6 \
+            "ipv4"  "Edit IPv4 Configuration (DHCP / Static / Disabled)" \
+            "ipv6"  "Edit IPv6 Configuration (Auto / Static / Disabled)" \
+            "wifi"  "Connect to a Wi-Fi Network (Wireless interfaces)" \
+            "apply" "Apply & Test Connection Live Now" \
+            "save"  "[ Save & Return to Network Overview ]") || return 0
+
+        case "$action" in
+            ipv4)
+                mode=$(dlg --title " IPv4 Method (${iface}) " \
+                    --menu "\nSelect IPv4 configuration method for ${iface}:" 13 65 3 \
+                    "dhcp"     "Automatic (DHCP)" \
+                    "static"   "Manual (Static IPv4, Subnet CIDR, Gateway, DNS)" \
+                    "disabled" "Disable IPv4 on this interface") || continue
+                if [ "$mode" = "static" ]; then
+                    local cur_ip
+                    cur_ip=$(ip -4 -br addr show "$iface" 2>/dev/null | awk '{print $3}' | head -n1)
+                    local cur_gw
+                    cur_gw=$(ip route show default dev "$iface" 2>/dev/null | awk '{print $3}' | head -n1)
+                    ip4=$(dlg --title " Static IPv4 Address " --inputbox "\nEnter IPv4 address with CIDR prefix (e.g. 192.168.1.50/24):" 10 68 "${ip4:-${cur_ip:-192.168.1.50/24}}") || continue
+                    gw4=$(dlg --title " IPv4 Default Gateway " --inputbox "\nEnter default gateway IPv4 address (leave empty if none):" 10 68 "${gw4:-${cur_gw:-192.168.1.1}}") || continue
+                    dns4=$(dlg --title " DNS Servers " --inputbox "\nEnter DNS servers (comma-separated):" 10 68 "${dns4:-1.1.1.1,8.8.8.8}") || continue
+                else
+                    ip4=""
+                    gw4=""
+                fi
+                ;;
+            ipv6)
+                ip6_mode=$(dlg --title " IPv6 Method (${iface}) " \
+                    --menu "\nSelect IPv6 configuration method for ${iface}:" 13 65 3 \
+                    "auto"     "Automatic (SLAAC / DHCPv6)" \
+                    "static"   "Manual (Static IPv6 Address & Gateway)" \
+                    "disabled" "Disable IPv6 on this interface") || continue
+                if [ "$ip6_mode" = "static" ]; then
+                    ip6_addr=$(dlg --title " Static IPv6 Address " --inputbox "\nEnter IPv6 address with prefix (e.g. 2a01:4f8::2/64):" 10 68 "${ip6_addr}") || continue
+                    ip6_gw=$(dlg --title " IPv6 Gateway " --inputbox "\nEnter IPv6 gateway (e.g. fe80::1):" 10 68 "${ip6_gw}") || continue
+                else
+                    ip6_addr=""
+                    ip6_gw=""
+                fi
+                ;;
+            wifi)
+                if command -v nmcli >/dev/null; then
+                    nmcli device wifi rescan ifname "$iface" >>"$LOG_FILE" 2>&1 || true
+                    local ssid pass
+                    ssid=$(dlg --title " Wi-Fi SSID " --inputbox "\nEnter Wi-Fi network name (SSID):" 10 60 "") || continue
+                    if [ -n "$ssid" ]; then
+                        pass=$(dlg --title " Wi-Fi Password " --insecure --passwordbox "\nEnter Wi-Fi password for '${ssid}':" 10 60) || continue
+                        if nmcli device wifi connect "$ssid" password "$pass" ifname "$iface" >>"$LOG_FILE" 2>&1; then
+                            dlg --title " Wi-Fi Connected " --msgbox "\nSuccessfully connected to '${ssid}'!" 8 55
+                        else
+                            dlg --title " Wi-Fi Error " --msgbox "\nCould not connect to '${ssid}'. Check /tmp/kaaijkos-install.log." 9 60
+                        fi
+                    fi
+                else
+                    dlg --title " Unavailable " --msgbox "\nnmcli is not available." 8 45
+                fi
+                ;;
+            apply)
+                if [ "$DRY_RUN" -eq 0 ] && command -v nmcli >/dev/null; then
+                    if [ "$mode" = "static" ] && [ -n "$ip4" ]; then
+                        ip addr flush dev "$iface" >>"$LOG_FILE" 2>&1 || true
+                        ip addr add "$ip4" dev "$iface" >>"$LOG_FILE" 2>&1 || true
+                        ip link set "$iface" up >>"$LOG_FILE" 2>&1 || true
+                        [ -n "$gw4" ] && ip route replace default via "$gw4" dev "$iface" >>"$LOG_FILE" 2>&1 || true
+                    fi
+                fi
+                dlg --title " Applied " --msgbox "\nConfiguration saved for ${iface}." 8 50
+                ;;
+            save)
+                cat << ENVEOF > "$conf_file"
+IFACE="${iface}"
+mode="${mode}"
+ip4="${ip4}"
+gw4="${gw4}"
+dns4="${dns4}"
+ip6_mode="${ip6_mode}"
+ip6_addr="${ip6_addr}"
+ip6_gw="${ip6_gw}"
+ENVEOF
+                return 0
+                ;;
+        esac
+    done
+}
+
+while true; do
+    NET_MENU_ITEMS=()
+    while IFS= read -r line; do
+        ifname=$(echo "$line" | awk '{print $1}')
+        ifstate=$(echo "$line" | awk '{print $2}')
+        ifip=$(echo "$line" | awk '{print $3}')
+        if [ -f "${NET_CONFIG_DIR}/${ifname}.env" ]; then
+            # shellcheck disable=SC1090
+            source "${NET_CONFIG_DIR}/${ifname}.env"
+            NET_MENU_ITEMS+=("$ifname" "Configured: IPv4=${mode^^} ${ip4:-($ifip)} | IPv6=${ip6_mode^^}")
+        else
+            NET_MENU_ITEMS+=("$ifname" "State: ${ifstate}  |  Current: ${ifip:-DHCP / Unconfigured}")
+            cat << DEFENV > "${NET_CONFIG_DIR}/${ifname}.env"
+IFACE="${ifname}"
+mode="dhcp"
+ip4=""
+gw4=""
+dns4="1.1.1.1,8.8.8.8"
+ip6_mode="auto"
+ip6_addr=""
+ip6_gw=""
+DEFENV
+        fi
+    done < <(ip -br addr | grep -v '^lo')
+
+    NET_MENU_ITEMS+=("DONE" "[ Done - Continue to Storage Configuration ]")
+
+    NET_CHOICE=$(dlg --title " Network Connections " \
+        --menu "\nConfigure network interfaces (select an interface to set DHCP, Static IPv4/IPv6, Gateway, DNS or Wi-Fi, or select DONE to continue):" 17 76 6 \
+        "${NET_MENU_ITEMS[@]}") || abort_install
+
+    if [ "$NET_CHOICE" = "DONE" ]; then
+        break
+    else
+        configure_interface "$NET_CHOICE"
+    fi
+done
+
+# ------------------------------------------------------------------------------
+# 6. STORAGE CONFIGURATION (GUIDED OR CUSTOM MANUAL LAYOUT)
+# ------------------------------------------------------------------------------
+STORAGE_MODE=""
+TARGET_DISK=""
+SWAP_MODE="zram"
+SWAP_SIZE="4G"
+BOOT_SIZE="512M"
+CUSTOM_ROOT_PART=""
+CUSTOM_BOOT_PART=""
+CUSTOM_HOME_PART=""
+CUSTOM_SWAP_PART=""
+FORMAT_ROOT="yes"
+FORMAT_BOOT="yes"
+FORMAT_HOME="no"
+
+select_physical_disk() {
+    local items=()
+    while IFS= read -r line; do
+        local dname="/dev/$(echo "$line" | awk '{print $1}')"
+        local dsize
+        dsize=$(echo "$line" | awk '{print $2}')
+        local dmodel
+        dmodel=$(echo "$line" | cut -d' ' -f3-)
+        items+=("$dname" "${dsize}  -  ${dmodel:-Disk}")
+    done < <(lsblk -d -n -o NAME,SIZE,MODEL -e 7,11 2>/dev/null)
+    if [ "${#items[@]}" -eq 0 ]; then
+        dlg --title " Error " --msgbox "\nNo storage disks detected!" 8 45
+        exit 1
+    fi
+    dlg --title " Select Target Disk " \
+        --menu "\nSelect the disk to use for KaaijkOS 1.0 (${BOOT_MODE} mode):" 16 74 6 "${items[@]}"
+}
+
+while true; do
+    STORAGE_MODE=$(dlg --title " Storage Configuration " \
+        --menu "\nHow would you like to partition your storage?" 14 74 2 \
+        "guided" "Guided - Use entire disk (Automatic ${BOOT_MODE} layout + customizable swap)" \
+        "custom" "Custom Storage Layout (Manual partitioning with cfdisk & mountpoints)") || abort_install
+
+    if [ "$STORAGE_MODE" = "guided" ]; then
+        TARGET_DISK=$(select_physical_disk) || continue
+        BOOT_SIZE=$(dlg --title " Boot Partition Size " \
+            --inputbox "\nEnter size for /boot partition (e.g. 512M or 1G):" 10 60 "512M") || continue
+        SWAP_MODE=$(dlg --title " Swap Configuration " \
+            --menu "\nChoose swap configuration:" 14 70 3 \
+            "zram" "ZRAM compressed RAM swap (50% of RAM, zstd - Recommended)" \
+            "part" "Dedicated Swap Partition on disk" \
+            "none" "No swap") || continue
+        if [ "$SWAP_MODE" = "part" ]; then
+            SWAP_SIZE=$(dlg --title " Swap Partition Size " \
+                --inputbox "\nEnter dedicated swap partition size (e.g. 2G, 4G, 8G):" 10 60 "4G") || continue
+        fi
+        break
+    else
+        # CUSTOM STORAGE LAYOUT
+        TARGET_DISK=$(select_physical_disk) || continue
+        while true; do
+            PART_TABLE_TEXT=$(lsblk -o NAME,SIZE,FSTYPE,TYPE "$TARGET_DISK" 2>/dev/null)
+            CUSTOM_ACT=$(dlg --title " Custom Storage Layout (${TARGET_DISK}) " \
+                --menu "\nCurrent partitions on ${TARGET_DISK}:\n${PART_TABLE_TEXT}\n\nAssigned Mountpoints:\n  • Root (/)   : ${CUSTOM_ROOT_PART:-UNASSIGNED} (Format: ${FORMAT_ROOT})\n  • Boot (/boot): ${CUSTOM_BOOT_PART:-None / Inside Root} (Format: ${FORMAT_BOOT})\n  • Home (/home): ${CUSTOM_HOME_PART:-None} (Format: ${FORMAT_HOME})\n  • Swap       : ${CUSTOM_SWAP_PART:-None (ZRAM: $SWAP_MODE)}\n\nSelect an action:" 24 76 6 \
+                "cfdisk" "Open Interactive Partition Editor (cfdisk ${TARGET_DISK})" \
+                "root"   "Select & Configure Root (/) Partition (Required)" \
+                "boot"   "Select & Configure Boot (/boot or EFI) Partition" \
+                "home"   "Select & Configure Home (/home) Partition (Optional)" \
+                "swap"   "Select & Configure Swap Partition / ZRAM" \
+                "done"   "[ Done - Continue with this Custom Layout ]") || break
+
+            list_disk_parts() {
+                local pitems=()
+                while IFS= read -r pline; do
+                    local pname="/dev/$(echo "$pline" | awk '{print $1}')"
+                    local psize
+                    psize=$(echo "$pline" | awk '{print $2}')
+                    local pfs
+                    pfs=$(echo "$pline" | awk '{print $3}')
+                    pitems+=("$pname" "Size: ${psize}  |  FS: ${pfs:-unformatted}")
+                done < <(lsblk -ln -o NAME,SIZE,FSTYPE,TYPE "$TARGET_DISK" | awk '$4=="part"{print $1, $2, $3}')
+                if [ "${#pitems[@]}" -eq 0 ]; then
+                    dlg --title " No Partitions " --msgbox "\nNo partitions found on ${TARGET_DISK}. Run 'cfdisk' first to create partitions." 9 60
+                    return 1
+                fi
+                dlg --title " Select Partition " --menu "\nChoose a partition from ${TARGET_DISK}:" 15 68 6 "${pitems[@]}"
+            }
+
+            case "$CUSTOM_ACT" in
+                cfdisk)
+                    if [ "$DRY_RUN" -eq 1 ]; then
+                        dlg --title " Dry-Run " --msgbox "\nIn real mode, 'cfdisk ${TARGET_DISK}' opens here. In --dry-run mode, we keep your disk untouched and let you select existing partitions." 10 65
+                    else
+                        clear
+                        cfdisk "$TARGET_DISK"
+                        partprobe "$TARGET_DISK" 2>/dev/null || true
+                    fi
+                    ;;
+                root)
+                    if PSEL=$(list_disk_parts); then
+                        CUSTOM_ROOT_PART="$PSEL"
+                        if dlg --title " Format Root (/) " --yesno "\nFormat ${CUSTOM_ROOT_PART} as ext4?" 8 55; then
+                            FORMAT_ROOT="yes"
+                        else
+                            FORMAT_ROOT="no"
+                        fi
+                    fi
+                    ;;
+                boot)
+                    if PSEL=$(list_disk_parts); then
+                        CUSTOM_BOOT_PART="$PSEL"
+                        if dlg --title " Format /boot " --yesno "\nFormat ${CUSTOM_BOOT_PART} ($([ "$BOOT_MODE" = "UEFI" ] && echo "FAT32 EFI" || echo "ext4"))?" 8 58; then
+                            FORMAT_BOOT="yes"
+                        else
+                            FORMAT_BOOT="no"
+                        fi
+                    fi
+                    ;;
+                home)
+                    if PSEL=$(list_disk_parts); then
+                        CUSTOM_HOME_PART="$PSEL"
+                        if dlg --title " Format /home " --yesno "\nFormat ${CUSTOM_HOME_PART} as ext4? (Select 'No' to keep existing data)" 9 62; then
+                            FORMAT_HOME="yes"
+                        else
+                            FORMAT_HOME="no"
+                        fi
+                    fi
+                    ;;
+                swap)
+                    SWAP_CHOICE=$(dlg --title " Swap Configuration " --menu "\nChoose swap method:" 13 65 3 \
+                        "zram" "Use ZRAM compressed memory swap" \
+                        "part" "Select a swap partition from ${TARGET_DISK}" \
+                        "none" "No swap") || continue
+                    if [ "$SWAP_CHOICE" = "part" ]; then
+                        if PSEL=$(list_disk_parts); then
+                            CUSTOM_SWAP_PART="$PSEL"
+                            SWAP_MODE="part"
+                        fi
+                    else
+                        CUSTOM_SWAP_PART=""
+                        SWAP_MODE="$SWAP_CHOICE"
+                    fi
+                    ;;
+                done)
+                    if [ -z "$CUSTOM_ROOT_PART" ]; then
+                        dlg --title " Missing Root Partition " --msgbox "\nYou must assign at least a Root (/) partition before continuing." 8 60
+                        continue
+                    fi
+                    if [ "$BOOT_MODE" = "UEFI" ] && [ -z "$CUSTOM_BOOT_PART" ]; then
+                        dlg --title " Missing EFI Boot Partition " --msgbox "\nIn UEFI mode, you must assign an EFI System Partition for /boot." 8 64
+                        continue
+                    fi
+                    break 2
+                    ;;
+            esac
+        done
+    fi
+done
+
+# ------------------------------------------------------------------------------
+# 7. PROFILE SETUP (HOSTNAME, ROOT, OPTIONAL SUDO USER)
+# ------------------------------------------------------------------------------
+TARGET_HOSTNAME=$(dlg --title " Profile Setup - Hostname " \
+    --inputbox "\nEnter the hostname for this system:" 10 60 "KaaijkOS") || abort_install
 TARGET_HOSTNAME="${TARGET_HOSTNAME:-KaaijkOS}"
 
 while true; do
-    ROOT_PASS=$(dlg --title " Stap 6/7: Root-wachtwoord " --insecure --passwordbox "\nKies een wachtwoord voor de 'root' administrator:" 10 60) || abort_install
-    ROOT_PASS2=$(dlg --title " Stap 6/7: Root-wachtwoord bevestigen " --insecure --passwordbox "\nVoer het root-wachtwoord nogmaals in:" 10 60) || abort_install
+    ROOT_PASS=$(dlg --title " Profile Setup - Root Password " --insecure --passwordbox "\nEnter a password for the 'root' administrator account:" 10 64) || abort_install
+    ROOT_PASS2=$(dlg --title " Confirm Root Password " --insecure --passwordbox "\nConfirm the 'root' password:" 10 64) || abort_install
     if [ -z "$ROOT_PASS" ]; then
-        dlg --title " Fout " --msgbox "\nWachtwoord mag niet leeg zijn." 8 45
+        dlg --title " Error " --msgbox "\nPassword cannot be empty." 8 45
     elif [ "$ROOT_PASS" != "$ROOT_PASS2" ]; then
-        dlg --title " Fout " --msgbox "\nWachtwoorden komen niet overeen. Probeer het opnieuw." 8 55
+        dlg --title " Error " --msgbox "\nPasswords do not match. Please try again." 8 55
     else
         break
     fi
@@ -199,116 +501,168 @@ done
 
 EXTRA_USER=""
 EXTRA_PASS=""
-if dlg --title " Stap 6/7: Extra Gebruiker " --yesno "\nWil je naast 'root' ook een gewone gebruiker (met sudo-rechten) aanmaken?" 10 65; then
-    EXTRA_USER=$(dlg --title " Gebruikersnaam " --inputbox "\nKies een gebruikersnaam (kleine letters, bijv. faas):" 10 60 "") || abort_install
+if dlg --title " Profile Setup - Additional User " --yesno "\nWould you like to create a standard user account (with sudo privileges) in addition to 'root'?" 10 68; then
+    EXTRA_USER=$(dlg --title " Username " --inputbox "\nEnter username (lowercase, e.g. admin):" 10 60 "") || abort_install
     if [ -n "$EXTRA_USER" ]; then
         while true; do
-            EXTRA_PASS=$(dlg --title " Wachtwoord voor ${EXTRA_USER} " --insecure --passwordbox "\nKies een wachtwoord voor '${EXTRA_USER}':" 10 60) || abort_install
-            EXTRA_PASS2=$(dlg --title " Bevestig wachtwoord " --insecure --passwordbox "\nVoer het wachtwoord voor '${EXTRA_USER}' nogmaals in:" 10 60) || abort_install
+            EXTRA_PASS=$(dlg --title " Password for ${EXTRA_USER} " --insecure --passwordbox "\nEnter a password for '${EXTRA_USER}':" 10 60) || abort_install
+            EXTRA_PASS2=$(dlg --title " Confirm Password " --insecure --passwordbox "\nConfirm password for '${EXTRA_USER}':" 10 60) || abort_install
             if [ -n "$EXTRA_PASS" ] && [ "$EXTRA_PASS" = "$EXTRA_PASS2" ]; then
                 break
             fi
-            dlg --title " Fout " --msgbox "\nWachtwoorden zijn leeg of komen niet overeen." 8 55
+            dlg --title " Error " --msgbox "\nPasswords are empty or do not match." 8 50
         done
     fi
 fi
 
 # ------------------------------------------------------------------------------
-# STAP 7: SSH SERVER & GITHUB KEYS
+# 8. SSH CONFIGURATION & GITHUB KEY IMPORT
 # ------------------------------------------------------------------------------
-ENABLE_SSH="Ja"
+ENABLE_SSH="yes"
 GITHUB_USER=""
-if dlg --title " Stap 7/7: OpenSSH Server " --yesno "\nWil je de OpenSSH-server (sshd) automatisch inschakelen bij het opstarten?" 10 65; then
-    ENABLE_SSH="Ja"
-    GITHUB_USER=$(dlg --title " Stap 7/7: SSH Keys importeren van GitHub (Optioneel) " \
-        --inputbox "\nVoer je GitHub-gebruikersnaam in om je publieke SSH-keys automatisch in te stellen (of laat leeg om over te slaan):" 11 68 "") || abort_install
+if dlg --title " SSH Setup " --yesno "\nInstall and enable the OpenSSH Server (sshd) on boot?" 9 62; then
+    ENABLE_SSH="yes"
+    GITHUB_USER=$(dlg --title " Import SSH Identity from GitHub " \
+        --inputbox "\nEnter a GitHub username to import their public SSH keys into authorized_keys (or leave empty to skip):" 11 68 "") || abort_install
 else
-    ENABLE_SSH="Nee"
+    ENABLE_SSH="no"
 fi
 
 # ------------------------------------------------------------------------------
-# STAP 8: SAMENVATTING & BEVESTIGING
+# 9. REVIEW & CONFIRM
 # ------------------------------------------------------------------------------
-SUMMARY="\nControleer je keuzes voordat de schijf wordt geformatteerd:\n
-  • Boot-modus     : ${BOOT_MODE} ($([ "$BOOT_MODE" = "UEFI" ] && echo "GPT + systemd-boot UKI" || echo "GPT + GRUB Legacy BIOS"))
-  • Doelschijf     : ${TARGET_DISK} (WORDT VOLLEDIG GEWIST!)
-  • ZRAM Swap      : ${ENABLE_ZRAM}
-  • Hostname       : ${TARGET_HOSTNAME}
-  • Toetsenbord    : ${KEYMAP}  |  Locale: ${LOCALE}
-  • Tijdzone       : ${TIMEZONE}
-  • Netwerk        : ${NET_IFACE} (${NET_MODE^^}${STATIC_IP:+ -> $STATIC_IP})
-  • Extra user     : ${EXTRA_USER:-Geen (alleen root)}
-  • OpenSSH Server : ${ENABLE_SSH} ${GITHUB_USER:+(GitHub keys: $GITHUB_USER)}\n"
+if [ "$STORAGE_MODE" = "guided" ]; then
+    STORAGE_SUMMARY="Guided Whole-Disk on ${TARGET_DISK} (/boot: ${BOOT_SIZE}, Swap: ${SWAP_MODE}${SWAP_SIZE:+ $SWAP_SIZE})"
+else
+    STORAGE_SUMMARY="Custom Layout (/: ${CUSTOM_ROOT_PART}, /boot: ${CUSTOM_BOOT_PART:-none}, /home: ${CUSTOM_HOME_PART:-none})"
+fi
+
+SUMMARY="\nPlease review your installation settings before proceeding:\n
+  • Firmware / Boot : ${BOOT_MODE} ($([ "$BOOT_MODE" = "UEFI" ] && echo "systemd-boot + UKI" || echo "GRUB i386-pc BIOS"))
+  • Storage Layout  : ${STORAGE_SUMMARY}
+  • Hostname        : ${TARGET_HOSTNAME}
+  • Keyboard / Lang : ${KEYMAP}  |  ${LOCALE}
+  • Timezone        : ${TIMEZONE}
+  • Additional User : ${EXTRA_USER:-None (root only)}
+  • OpenSSH Server  : ${ENABLE_SSH} ${GITHUB_USER:+(GitHub keys: $GITHUB_USER)}\n"
 
 if [ "$DRY_RUN" -eq 1 ]; then
-    SUMMARY="${SUMMARY}\n[DRY-RUN ACTIEF: Er wordt NIETS naar ${TARGET_DISK} geschreven!]"
+    SUMMARY="${SUMMARY}\n[DRY-RUN MODE: No changes will be written to ${TARGET_DISK}!]"
 fi
 
-dlg --title " Installatie Bevestigen " --yes-label "Nu Installeren" --no-label "Annuleren" \
-    --yesno "$SUMMARY" 22 76 || abort_install
+dlg --title " Confirm Installation " --yes-label "Install Now" --no-label "Cancel" \
+    --yesno "$SUMMARY" 21 78 || abort_install
 
 # ------------------------------------------------------------------------------
-# STAP 9: UITVOERING MET VOORTGANGSBALK
+# 10. INSTALLATION PROGRESS
 # ------------------------------------------------------------------------------
 if [ "$DRY_RUN" -eq 1 ]; then
     {
-        echo 15; echo "XXX"; echo "15% - [DRY-RUN] Schijf ${TARGET_DISK} partitioneren (${BOOT_MODE})..."; echo "XXX"; sleep 1
-        echo 40; echo "XXX"; echo "40% - [DRY-RUN] KaaijkOS 1.0 basissysteem installeren..."; echo "XXX"; sleep 1
-        echo 70; echo "XXX"; echo "70% - [DRY-RUN] Netwerk, locale, tijdzone & gebruikers configureren..."; echo "XXX"; sleep 1
-        echo 90; echo "XXX"; echo "90% - [DRY-RUN] Bootloader (${BOOT_MODE}) & initramfs opbouwen..."; echo "XXX"; sleep 1
-        echo 100; echo "XXX"; echo "100% - [DRY-RUN] Test succesvol afgerond!"; echo "XXX"; sleep 1
-    } | dlg --title " KaaijkOS 1.0 Installeren (DRY-RUN) " --gauge "\nBezig met voorbereiden..." 10 70 0
+        echo 15; echo "XXX"; echo "15% - [DRY-RUN] Applying ${STORAGE_MODE} storage layout on ${TARGET_DISK}..."; echo "XXX"; sleep 1
+        echo 45; echo "XXX"; echo "45% - [DRY-RUN] Extracting KaaijkOS 1.0 base system..."; echo "XXX"; sleep 1
+        echo 75; echo "XXX"; echo "75% - [DRY-RUN] Configuring network, timezone (${TIMEZONE}) & users..."; echo "XXX"; sleep 1
+        echo 95; echo "XXX"; echo "95% - [DRY-RUN] Installing ${BOOT_MODE} bootloader & building initramfs..."; echo "XXX"; sleep 1
+        echo 100; echo "XXX"; echo "100% - [DRY-RUN] Simulation completed successfully!"; echo "XXX"; sleep 1
+    } | dlg --title " Installing KaaijkOS 1.0 (DRY-RUN) " --gauge "\nPreparing installation..." 10 74 0
 
-    dlg --title " Dry-Run Voltooid! " --msgbox "\nDe TUI-installer werkt 100% naar behoren!\n\nOmdat --dry-run actief was, is er geen enkele schijf aangepast." 10 65
+    dlg --title " Dry-Run Complete " --msgbox "\nThe installer completed all steps in dry-run mode.\nNo disks were modified." 9 62
     clear
     exit 0
 fi
 
-# Bepaal partitienamen (bijv. /dev/sda1 vs /dev/nvme0n1p1)
-if [[ "$TARGET_DISK" =~ [0-9]$ ]]; then
-    P_PRE="${TARGET_DISK}p"
-else
-    P_PRE="${TARGET_DISK}"
-fi
+P_PRE=$(part_prefix "$TARGET_DISK")
 
 {
-    echo 5; echo "XXX"; echo "5% - Schijf ${TARGET_DISK} partitioneren voor ${BOOT_MODE}..."; echo "XXX"
-    wipefs -af "$TARGET_DISK" >>"$LOG_FILE" 2>&1
-    if [ "$BOOT_MODE" = "UEFI" ]; then
-        sfdisk "$TARGET_DISK" >>"$LOG_FILE" 2>&1 << 'PARTS'
+    echo 5; echo "XXX"; echo "5% - Configuring storage & filesystems on ${TARGET_DISK}..."; echo "XXX"
+    if [ "$STORAGE_MODE" = "guided" ]; then
+        wipefs -af "$TARGET_DISK" >>"$LOG_FILE" 2>&1
+        if [ "$BOOT_MODE" = "UEFI" ]; then
+            if [ "$SWAP_MODE" = "part" ]; then
+                sfdisk "$TARGET_DISK" >>"$LOG_FILE" 2>&1 << PARTS
 label: gpt
-size=512M, type=U
+size=${BOOT_SIZE}, type=U
+size=${SWAP_SIZE}, type=S
 type=L
 PARTS
-        BOOT_PART="${P_PRE}1"
-        ROOT_PART="${P_PRE}2"
-        partprobe "$TARGET_DISK" >>"$LOG_FILE" 2>&1 || true
-        sleep 1
-        mkfs.fat -F32 "$BOOT_PART" >>"$LOG_FILE" 2>&1
-        mkfs.ext4 -F "$ROOT_PART" >>"$LOG_FILE" 2>&1
-    else
-        # Legacy BIOS op GPT: 2M BIOS Boot Partition + ext4 Root
-        sfdisk "$TARGET_DISK" >>"$LOG_FILE" 2>&1 << 'PARTS'
+                BOOT_PART="${P_PRE}1"
+                SWAP_PART="${P_PRE}2"
+                ROOT_PART="${P_PRE}3"
+            else
+                sfdisk "$TARGET_DISK" >>"$LOG_FILE" 2>&1 << PARTS
+label: gpt
+size=${BOOT_SIZE}, type=U
+type=L
+PARTS
+                BOOT_PART="${P_PRE}1"
+                SWAP_PART=""
+                ROOT_PART="${P_PRE}2"
+            fi
+            partprobe "$TARGET_DISK" >>"$LOG_FILE" 2>&1 || true
+            sleep 1
+            mkfs.fat -F32 "$BOOT_PART" >>"$LOG_FILE" 2>&1
+            [ -n "$SWAP_PART" ] && mkswap "$SWAP_PART" >>"$LOG_FILE" 2>&1
+            mkfs.ext4 -F "$ROOT_PART" >>"$LOG_FILE" 2>&1
+        else
+            # Legacy BIOS on GPT
+            if [ "$SWAP_MODE" = "part" ]; then
+                sfdisk "$TARGET_DISK" >>"$LOG_FILE" 2>&1 << PARTS
+label: gpt
+size=2M, type=21686148-6449-6E6F-744E-656564454649
+size=${SWAP_SIZE}, type=S
+type=L
+PARTS
+                BOOT_PART=""
+                SWAP_PART="${P_PRE}2"
+                ROOT_PART="${P_PRE}3"
+            else
+                sfdisk "$TARGET_DISK" >>"$LOG_FILE" 2>&1 << PARTS
 label: gpt
 size=2M, type=21686148-6449-6E6F-744E-656564454649
 type=L
 PARTS
-        BOOT_PART=""
-        ROOT_PART="${P_PRE}2"
-        partprobe "$TARGET_DISK" >>"$LOG_FILE" 2>&1 || true
-        sleep 1
-        mkfs.ext4 -F "$ROOT_PART" >>"$LOG_FILE" 2>&1
+                BOOT_PART=""
+                SWAP_PART=""
+                ROOT_PART="${P_PRE}2"
+            fi
+            partprobe "$TARGET_DISK" >>"$LOG_FILE" 2>&1 || true
+            sleep 1
+            [ -n "$SWAP_PART" ] && mkswap "$SWAP_PART" >>"$LOG_FILE" 2>&1
+            mkfs.ext4 -F "$ROOT_PART" >>"$LOG_FILE" 2>&1
+        fi
+        HOME_PART=""
+    else
+        # Custom storage layout
+        ROOT_PART="$CUSTOM_ROOT_PART"
+        BOOT_PART="$CUSTOM_BOOT_PART"
+        HOME_PART="$CUSTOM_HOME_PART"
+        SWAP_PART="$CUSTOM_SWAP_PART"
+        [ "$FORMAT_ROOT" = "yes" ] && mkfs.ext4 -F "$ROOT_PART" >>"$LOG_FILE" 2>&1
+        if [ -n "$BOOT_PART" ] && [ "$FORMAT_BOOT" = "yes" ]; then
+            if [ "$BOOT_MODE" = "UEFI" ]; then
+                mkfs.fat -F32 "$BOOT_PART" >>"$LOG_FILE" 2>&1
+            else
+                mkfs.ext4 -F "$BOOT_PART" >>"$LOG_FILE" 2>&1
+            fi
+        fi
+        [ -n "$HOME_PART" ] && [ "$FORMAT_HOME" = "yes" ] && mkfs.ext4 -F "$HOME_PART" >>"$LOG_FILE" 2>&1
+        [ -n "$SWAP_PART" ] && mkswap "$SWAP_PART" >>"$LOG_FILE" 2>&1
     fi
 
-    echo 20; echo "XXX"; echo "20% - Partities mounten & KaaijkOS systeem kopiëren..."; echo "XXX"
+    echo 20; echo "XXX"; echo "20% - Mounting target filesystems & installing KaaijkOS base..."; echo "XXX"
     mkdir -p "$MNT"
     mount "$ROOT_PART" "$MNT"
     if [ -n "$BOOT_PART" ]; then
         mkdir -p "$MNT/boot"
         mount "$BOOT_PART" "$MNT/boot"
     fi
+    if [ -n "${HOME_PART:-}" ]; then
+        mkdir -p "$MNT/home"
+        mount "$HOME_PART" "$MNT/home"
+    fi
 
-    if [ -f /root/KaaijkOS-1.0-base-rootfs.tar.zst ]; then
+    if [ -d /run/sfs/usr ]; then
+        cp -a /run/sfs/. "$MNT/" >>"$LOG_FILE" 2>&1
+    elif [ -f /root/KaaijkOS-1.0-base-rootfs.tar.zst ]; then
         tar -C "$MNT" --zstd -xpf /root/KaaijkOS-1.0-base-rootfs.tar.zst >>"$LOG_FILE" 2>&1
     else
         tar --one-file-system \
@@ -317,15 +671,28 @@ PARTS
             --exclude=/etc/ssh/ssh_host_* --exclude=/etc/machine-id \
             -cf - / | tar -C "$MNT" -xpf - >>"$LOG_FILE" 2>&1
     fi
-    mkdir -p "$MNT"/{proc,sys,dev,tmp,run,mnt,boot}
+    mkdir -p "$MNT"/{proc,sys,dev,tmp,run,mnt,boot,home}
 
-    echo 55; echo "XXX"; echo "55% - Systeemconfiguratie, tijdzone, locale & fstab instellen..."; echo "XXX"
+    echo 55; echo "XXX"; echo "55% - Writing fstab, locale, timezone & network connections..."; echo "XXX"
     ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
     ROOT_PARTUUID=$(blkid -s PARTUUID -o value "$ROOT_PART")
     echo "UUID=${ROOT_UUID}  /  ext4  rw,relatime  0 1" > "$MNT/etc/fstab"
     if [ -n "$BOOT_PART" ]; then
         BOOT_UUID=$(blkid -s UUID -o value "$BOOT_PART")
-        echo "UUID=${BOOT_UUID}  /boot  vfat  rw,relatime,fmask=0077,dmask=0077  0 2" >> "$MNT/etc/fstab"
+        BOOT_FSTYPE=$(blkid -s TYPE -o value "$BOOT_PART")
+        if [ "$BOOT_FSTYPE" = "vfat" ]; then
+            echo "UUID=${BOOT_UUID}  /boot  vfat  rw,relatime,fmask=0077,dmask=0077  0 2" >> "$MNT/etc/fstab"
+        else
+            echo "UUID=${BOOT_UUID}  /boot  ${BOOT_FSTYPE}  rw,relatime  0 2" >> "$MNT/etc/fstab"
+        fi
+    fi
+    if [ -n "${HOME_PART:-}" ]; then
+        HOME_UUID=$(blkid -s UUID -o value "$HOME_PART")
+        echo "UUID=${HOME_UUID}  /home  ext4  rw,relatime  0 2" >> "$MNT/etc/fstab"
+    fi
+    if [ -n "${SWAP_PART:-}" ]; then
+        SWAP_UUID=$(blkid -s UUID -o value "$SWAP_PART")
+        echo "UUID=${SWAP_UUID}  none  swap  defaults  0 0" >> "$MNT/etc/fstab"
     fi
 
     echo "$TARGET_HOSTNAME" > "$MNT/etc/hostname"
@@ -334,33 +701,39 @@ PARTS
     sed -i "s/^#${LOCALE}/${LOCALE}/" "$MNT/etc/locale.gen" 2>/dev/null || true
     ln -sf "/usr/share/zoneinfo/${TIMEZONE}" "$MNT/etc/localtime"
 
-    if [ "$ENABLE_ZRAM" = "Nee" ]; then
-        rm -f "$MNT/etc/systemd/zram-generator.conf"
-    else
+    if [ "$SWAP_MODE" = "zram" ]; then
         printf "[zram0]\nzram-size = ram / 2\ncompression-algorithm = zstd\n" > "$MNT/etc/systemd/zram-generator.conf"
+    else
+        rm -f "$MNT/etc/systemd/zram-generator.conf"
     fi
 
-    if [ "$NET_MODE" = "static" ]; then
-        mkdir -p "$MNT/etc/NetworkManager/system-connections"
-        cat << NMCONF > "$MNT/etc/NetworkManager/system-connections/${NET_IFACE}.nmconnection"
+    mkdir -p "$MNT/etc/NetworkManager/system-connections"
+    for nenv in "$NET_CONFIG_DIR"/*.env; do
+        [ -e "$nenv" ] || continue
+        # shellcheck disable=SC1090
+        source "$nenv"
+        if [ "$mode" = "static" ] || [ "$ip6_mode" != "auto" ]; then
+            cat << NMCONF > "$MNT/etc/NetworkManager/system-connections/${IFACE}.nmconnection"
 [connection]
-id=${NET_IFACE}
+id=${IFACE}
 type=ethernet
-interface-name=${NET_IFACE}
+interface-name=${IFACE}
 autoconnect=true
 
 [ipv4]
-method=manual
-address1=${STATIC_IP},${STATIC_GW}
-dns=${STATIC_DNS/,/;};
+method=$([ "$mode" = "static" ] && echo "manual" || ([ "$mode" = "disabled" ] && echo "disabled" || echo "auto"))
+$([ "$mode" = "static" ] && [ -n "$ip4" ] && echo "address1=${ip4}${gw4:+,${gw4}}")
+$([ "$mode" = "static" ] && [ -n "$dns4" ] && echo "dns=${dns4//,/;};")
 
 [ipv6]
-method=auto
+method=$([ "$ip6_mode" = "static" ] && echo "manual" || ([ "$ip6_mode" = "disabled" ] && echo "disabled" || echo "auto"))
+$([ "$ip6_mode" = "static" ] && [ -n "$ip6_addr" ] && echo "address1=${ip6_addr}${ip6_gw:+,${ip6_gw}}")
 NMCONF
-        chmod 600 "$MNT/etc/NetworkManager/system-connections/${NET_IFACE}.nmconnection"
-    fi
+            chmod 600 "$MNT/etc/NetworkManager/system-connections/${IFACE}.nmconnection"
+        fi
+    done
 
-    echo 75; echo "XXX"; echo "75% - Gebruikers, wachtwoorden & SSH-server configureren..."; echo "XXX"
+    echo 75; echo "XXX"; echo "75% - Configuring accounts, passwords & OpenSSH..."; echo "XXX"
     mount --types proc /proc "$MNT/proc"
     mount --rbind /sys "$MNT/sys"
     mount --rbind /dev "$MNT/dev"
@@ -381,7 +754,7 @@ NMCONF
     chroot "$MNT" ssh-keygen -A >>"$LOG_FILE" 2>&1
     chroot "$MNT" systemd-machine-id-setup >>"$LOG_FILE" 2>&1
 
-    if [ "$ENABLE_SSH" = "Ja" ]; then
+    if [ "$ENABLE_SSH" = "yes" ]; then
         chroot "$MNT" systemctl enable sshd.service >>"$LOG_FILE" 2>&1 || true
     else
         chroot "$MNT" systemctl disable sshd.service >>"$LOG_FILE" 2>&1 || true
@@ -398,9 +771,13 @@ NMCONF
         fi
     fi
 
-    echo 90; echo "XXX"; echo "90% - Bootloader (${BOOT_MODE}) & kernel image installeren..."; echo "XXX"
+    echo 90; echo "XXX"; echo "90% - Installing ${BOOT_MODE} bootloader & building initramfs..."; echo "XXX"
+    rm -f "$MNT/etc/systemd/system/getty@tty1.service.d/live-autologin.conf" \
+          "$MNT/etc/profile.d/zz-kaaijkos-live-installer.sh" 2>/dev/null || true
+
     if [ "$BOOT_MODE" = "UEFI" ]; then
-        mkdir -p "$MNT/boot/loader/entries" "$MNT/boot/EFI/KaaijkOS"
+        mkdir -p "$MNT/boot/loader/entries" "$MNT/boot/EFI/KaaijkOS" "$MNT/etc/kernel"
+        echo "root=PARTUUID=${ROOT_PARTUUID} zswap.enabled=0 rw rootfstype=ext4 quiet vt.global_cursor_default=0 fbcon=nodefer loglevel=3 rd.udev.log_level=3 systemd.show_status=auto" > "$MNT/etc/kernel/cmdline"
         printf "default kaaijkos.conf\ntimeout 0\nconsole-mode keep\neditor yes\n" > "$MNT/boot/loader/loader.conf"
         cat << ENTRY > "$MNT/boot/loader/entries/kaaijkos.conf"
 title KaaijkOS 1.0
@@ -410,7 +787,6 @@ ENTRY
         chroot "$MNT" bootctl --esp-path=/boot install --no-variables >>"$LOG_FILE" 2>&1
         chroot "$MNT" mkinitcpio -P >>"$LOG_FILE" 2>&1
     else
-        # Legacy BIOS: genereer losse vmlinuz + initramfs en installeer GRUB i386-pc
         KVER=$(ls "$MNT/usr/lib/modules" | head -n 1)
         cp "$MNT/usr/lib/modules/${KVER}/vmlinuz" "$MNT/boot/vmlinuz-kaaijkos"
         chroot "$MNT" mkinitcpio -k "$KVER" -g /boot/initramfs-kaaijkos.img >>"$LOG_FILE" 2>&1
@@ -429,12 +805,12 @@ GRUBCFG
         fi
     fi
 
-    echo 100; echo "XXX"; echo "100% - Installatie van KaaijkOS 1.0 voltooid!"; echo "XXX"
+    echo 100; echo "XXX"; echo "100% - KaaijkOS 1.0 installation complete!"; echo "XXX"
     sleep 1
-} | dlg --title " KaaijkOS 1.0 Installeren " --gauge "\nStarten met installatie..." 10 72 0
+} | dlg --title " Installing KaaijkOS 1.0 " --gauge "\nStarting installation..." 10 74 0
 
-if dlg --title " Installatie Voltooid! " --yes-label "Nu Herstarten" --no-label "Terug naar Shell" \
-    --yesno "\nKaaijkOS 1.0 is succesvol geïnstalleerd op ${TARGET_DISK}!\n\nVerwijder na het afsluiten het installatiemedium (ISO/USB).\nWil je het systeem nu direct herstarten?" 12 68; then
+if dlg --title " Installation Complete " --yes-label "Reboot Now" --no-label "Exit to Shell" \
+    --yesno "\nKaaijkOS 1.0 has been successfully installed to ${TARGET_DISK}!\n\nPlease remove the installation medium (ISO/USB) after rebooting.\nWould you like to reboot the system now?" 12 68; then
     clear
     reboot
 fi

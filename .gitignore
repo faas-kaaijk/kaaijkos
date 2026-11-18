@@ -1,7 +1,5 @@
-*.tar.xz
-*.tar.zst
 *.img
 *.iso
-*.efi
-linux-*/
-_kpkg_build/
+*.tar.zst
+*.sfs
+/work/
