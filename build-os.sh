@@ -13,6 +13,23 @@ for cmd in sfdisk losetup mkfs.fat mkfs.ext4 tar zstd curl chroot blkid; do
     command -v "$cmd" >/dev/null || { echo "Ontbrekend tool: $cmd" >&2; exit 1; }
 done
 
+# Vraag om een nieuw root-wachtwoord (of gebruik ROOT_PASS env var)
+if [ -z "${ROOT_PASS:-}" ]; then
+    while true; do
+        read -r -s -p "Kies een nieuw root-wachtwoord voor deze KaaijkOS build: " ROOT_PASS
+        echo
+        read -r -s -p "Bevestig root-wachtwoord: " ROOT_PASS_CONFIRM
+        echo
+        if [ -z "$ROOT_PASS" ]; then
+            echo "Wachtwoord mag niet leeg zijn."
+        elif [ "$ROOT_PASS" != "$ROOT_PASS_CONFIRM" ]; then
+            echo "Wachtwoorden komen niet overeen, probeer opnieuw."
+        else
+            break
+        fi
+    done
+fi
+
 if [ ! -f "$ROOTFS_TAR" ]; then
     echo "=== Base rootfs downloaden van GitHub Releases ==="
     curl -fL "$RELEASE_URL" -o "$ROOTFS_TAR"
@@ -69,7 +86,7 @@ mkdir -p "$MNT/boot/loader/entries" "$MNT/boot/EFI/KaaijkOS"
 cp -a "$REPO_DIR/rootfs-configs/boot/loader/." "$MNT/boot/loader/"
 sed -i "s|PARTUUID=[^ ]*|PARTUUID=${ROOT_PARTUUID}|g" "$MNT/boot/loader/entries/"*.conf
 
-echo "=== 5. systemd-boot & UKI genereren in chroot ==="
+echo "=== 5. Accounts, SSH-keys, systemd-boot & UKI genereren ==="
 mount --types proc /proc "$MNT/proc"
 mount --rbind /sys "$MNT/sys"
 mount --rbind /dev "$MNT/dev"
@@ -80,6 +97,10 @@ if [ "${BUILD_KERNEL:-0}" = "1" ]; then
     chroot "$MNT" /usr/src/kaaijkos/build-kernel.sh
 fi
 
+chroot "$MNT" pwconv
+chroot "$MNT" grpconv
+echo "root:${ROOT_PASS}" | chroot "$MNT" chpasswd
+chroot "$MNT" ssh-keygen -A
 chroot "$MNT" systemd-machine-id-setup
 chroot "$MNT" bootctl --esp-path=/boot install --no-variables
 chroot "$MNT" mkinitcpio -P
