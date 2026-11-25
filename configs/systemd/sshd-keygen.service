@@ -1,0 +1,8 @@
+[Unit]
+Description=Generate OpenSSH Host Keys
+Before=sshd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -A
+RemainAfterExit=yes

@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# KaaijkOS Eigen Kernel Builder (100% pure upstream kernel.org -> KaaijkOS)
+#
+# Kenmerken:
+# - Pure upstream Linux source (geen Arch-patches of Arch-branding)
+# - CONFIG_LOCALVERSION="-kaaijkos", CONFIG_DEFAULT_HOSTNAME="kaaijkos"
+# - Eigen KaaijkOS X.509 Module Signing Key (geen kernel-taint (E) meer!)
+# - Eigen KaaijkOS DRM Panic-scherm (geen qr_code foutmelding meer!)
+# - Twee standen:
+#     --mode fast       (aanrader op 1-2 vCPU VM: ~10-15 min op 1 core, ~2-3 min op 4+ cores)
+#     --mode universal  (alle desktop/laptop/Wi-Fi/GPU drivers: voor bare-metal ISO's)
+# - Maakt ALTIJD een GRUB fallback-entry naar je vorige werkende kernel!
+#
+# Gebruik:
+#   ./build_kaaijkos_kernel.sh                         # auto-mode + nieuwste stable
+#   ./build_kaaijkos_kernel.sh --mode fast             # snelle lean KaaijkOS kernel
+#   ./build_kaaijkos_kernel.sh --mode universal        # universele hardware-kernel
+#   ./build_kaaijkos_kernel.sh --version 7.1.8         # specifieke kernelversie
+#   ./build_kaaijkos_kernel.sh --menuconfig            # open menuconfig voor handmatige tweaks
+# ==============================================================================
+set -euo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "FOUT: Draai dit script als root." >&2
+    exit 1
+fi
+
+# ---- Argumenten parsen ----
+MODE="auto"
+VERSION=""
+OPEN_MENUCONFIG=0
+WITH_BTF=0
+JOBS="$(nproc 2>/dev/null || echo 1)"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --mode)       MODE="${2:?Ontbrekende waarde voor --mode}"; shift 2 ;;
+        --version)    VERSION="${2:?Ontbrekende waarde voor --version}"; shift 2 ;;
+        --jobs|-j)    JOBS="${2:?Ontbrekende waarde voor --jobs}"; shift 2 ;;
+        --menuconfig) OPEN_MENUCONFIG=1; shift ;;
+        --with-btf)   WITH_BTF=1; shift ;;
+        -h|--help)
+            sed -n '2,24p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "Onbekende optie: $1 (gebruik --help)" >&2
+            exit 1
+            ;;
+    esac
+done
+
+RAM_MB=$(awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo)
+if [ "$MODE" = "auto" ]; then
+    if [ "$JOBS" -le 2 ] || [ "$RAM_MB" -lt 3500 ]; then
+        MODE="fast"
+    else
+        MODE="universal"
+    fi
+fi
+
+case "$MODE" in
+    fast|universal) ;;
+    *) echo "FOUT: --mode moet 'fast' of 'universal' zijn (gegeven: $MODE)" >&2; exit 1 ;;
+esac
+
+# ---- Pre-flight checks ----
+echo "================================================================================"
+echo "  KaaijkOS Eigen Kernel Builder"
+echo "  CPU cores : ${JOBS}  |  RAM: ${RAM_MB} MB  |  Mode: ${MODE}"
+echo "================================================================================"
+
+MISSING=""
+for tool in gcc ld make bc bison flex perl openssl cpio zstd xz tar curl python3 mkinitcpio depmod; do
+    command -v "$tool" >/dev/null 2>&1 || MISSING="${MISSING} ${tool}"
+done
+if [ -n "$MISSING" ]; then
+    echo "FOUT: Ontbrekende build-tools:${MISSING}" >&2
+    exit 1
+fi
+
+FREE_GB=$(df -BG /usr/src 2>/dev/null | awk 'NR==2 {gsub(/G/,"",$4); print $4}')
+if [ "${FREE_GB:-0}" -lt 6 ]; then
+    echo "FOUT: Minimaal 6 GB vrije schijfruimte nodig (nu: ${FREE_GB:-0} GB)." >&2
+    exit 1
+fi
+
+# ---- 1. Kernelversie bepalen & downloaden van kernel.org ----
+WORKDIR="/usr/src/kaaijkos/kernel"
+mkdir -p "$WORKDIR"
+cd "$WORKDIR"
+
+TARBALL_URL=""
+if [ -z "$VERSION" ]; then
+    echo "[1/7] Nieuwste stabiele kernelversie opvragen bij kernel.org..."
+    REL_INFO=$(python3 - << 'PY' 2>/dev/null || true
+import json, urllib.request
+with urllib.request.urlopen("https://www.kernel.org/releases.json", timeout=15) as r:
+    data = json.load(r)
+for rel in data.get("releases", []):
+    if rel.get("moniker") == "stable" and rel.get("source"):
+        print(rel["version"], rel["source"])
+        break
+PY
+)
+    if [ -n "$REL_INFO" ]; then
+        VERSION=$(echo "$REL_INFO" | awk '{print $1}')
+        TARBALL_URL=$(echo "$REL_INFO" | awk '{print $2}')
+    else
+        VERSION=$(uname -r | sed 's/-.*//')
+        echo "  Kon kernel.org releases.json niet bereiken; val terug op huidige versie: ${VERSION}"
+    fi
+fi
+
+if [ -z "$TARBALL_URL" ]; then
+    MAJOR="${VERSION%%.*}"
+    TARBALL_URL="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${VERSION}.tar.xz"
+fi
+
+TARBALL="${WORKDIR}/linux-${VERSION}.tar.xz"
+SRCDIR="${WORKDIR}/linux-${VERSION}"
+
+echo "  Doelversie : Linux ${VERSION}-kaaijkos"
+echo "  Bron-URL   : ${TARBALL_URL}"
+
+if [ ! -f "$TARBALL" ]; then
+    echo "[2/7] Downloaden van linux-${VERSION}.tar.xz..."
+    curl -fL --progress-bar -o "${TARBALL}.part" "$TARBALL_URL"
+    mv "${TARBALL}.part" "$TARBALL"
+else
+    echo "[2/7] Bronarchief al aanwezig in cache: ${TARBALL}"
+fi
+
+if [ ! -d "$SRCDIR" ]; then
+    echo "  Uitpakken naar ${SRCDIR}..."
+    tar -xf "$TARBALL" -C "$WORKDIR"
+fi
+
+cd "$SRCDIR"
+
+# ---- 2. Eigen KaaijkOS Module Signing Key genereren ----
+echo "[3/7] Eigen KaaijkOS X.509 Module Signing Key voorbereiden..."
+SIGN_KEY="/etc/kernel/kaaijkos-signing-key.pem"
+mkdir -p /etc/kernel certs
+
+if [ ! -f "$SIGN_KEY" ]; then
+    cat << 'X509' > certs/kaaijkos-x509.genkey
+[ req ]
+default_bits = 4096
+distinguished_name = req_distinguished_name
+prompt = no
+string_mask = utf8only
+x509_extensions = myexts
+
+[ req_distinguished_name ]
+O = KaaijkOS
+CN = KaaijkOS Kernel Module Signing Key
+emailAddress = kernel@kaaijkos.com
+
+[ myexts ]
+basicConstraints=critical,CA:FALSE
+keyUsage=digitalSignature
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid
+X509
+    openssl req -new -nodes -utf8 -sha512 -days 36500 -batch -x509 \
+        -config certs/kaaijkos-x509.genkey \
+        -outform PEM -out "$SIGN_KEY" -keyout "$SIGN_KEY" 2>/dev/null
+    chmod 600 "$SIGN_KEY"
+    chown root:root "$SIGN_KEY"
+    rm -f certs/kaaijkos-x509.genkey
+    echo "  Nieuwe sleutel aangemaakt: ${SIGN_KEY}"
+else
+    echo "  Bestaande KaaijkOS sleutel hergebruikt: ${SIGN_KEY}"
+fi
+cp -f "$SIGN_KEY" certs/signing_key.pem
+chmod 600 certs/signing_key.pem
+
+# ---- 3. Kernel .config genereren & KaaijkOS-instellingen toepassen ----
+echo "[4/7] KaaijkOS kernelconfiguratie opbouwen (mode: ${MODE})..."
+
+if [ -r /proc/config.gz ]; then
+    zcat /proc/config.gz > .config
+elif [ -r "/boot/config-$(uname -r)" ]; then
+    cp "/boot/config-$(uname -r)" .config
+else
+    make defconfig
+fi
+
+if [ "$MODE" = "fast" ]; then
+    echo "  Toepassen van localmodconfig (alleen geladen drivers + essentiële KaaijkOS modules)..."
+    make olddefconfig >/dev/null; set +o pipefail; yes "" | make localmodconfig >/dev/null; set -o pipefail
+fi
+
+# --- KaaijkOS Identiteit (100% vrij van Arch-branding) ---
+./scripts/config --set-str LOCALVERSION "-kaaijkos"
+./scripts/config --disable LOCALVERSION_AUTO
+./scripts/config --set-str DEFAULT_HOSTNAME "kaaijkos"
+
+# --- Eigen KaaijkOS DRM Panic-scherm (lost 'qr_code' warning op) ---
+./scripts/config --enable DRM_PANIC
+./scripts/config --set-str DRM_PANIC_SCREEN "user"
+./scripts/config --set-val DRM_PANIC_FOREGROUND_COLOR 0xffffff
+./scripts/config --set-val DRM_PANIC_BACKGROUND_COLOR 0x0b192c
+
+# --- Module signing & Zstd compressie (lost kernel-taint (E) op) ---
+./scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
+./scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
+./scripts/config --enable MODULE_SIG
+./scripts/config --enable MODULE_SIG_ALL
+./scripts/config --disable MODULE_SIG_FORCE
+./scripts/config --enable MODULE_SIG_SHA512
+./scripts/config --set-str MODULE_SIG_HASH "sha512"
+./scripts/config --set-str MODULE_SIG_KEY "certs/signing_key.pem"
+./scripts/config --enable MODULE_SIG_KEY_TYPE_RSA
+./scripts/config --disable MODULE_SIG_KEY_TYPE_ECDSA
+./scripts/config --enable MODULE_COMPRESS
+./scripts/config --enable MODULE_COMPRESS_ZSTD
+./scripts/config --disable MODULE_COMPRESS_NONE
+./scripts/config --disable MODULE_COMPRESS_GZIP
+./scripts/config --disable MODULE_COMPRESS_XZ
+
+# --- Debug info & BTF (voorkomt OOM op 2 GB RAM en versnelt build enorm) ---
+if [ "$WITH_BTF" -eq 1 ]; then
+    ./scripts/config --enable DEBUG_INFO
+    ./scripts/config --enable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+    ./scripts/config --enable DEBUG_INFO_BTF
+    ./scripts/config --disable DEBUG_INFO_BTF_MODULES
+else
+    ./scripts/config --enable DEBUG_INFO_NONE
+    ./scripts/config --disable DEBUG_INFO
+    ./scripts/config --disable DEBUG_INFO_DWARF5
+    ./scripts/config --disable DEBUG_INFO_DWARF4
+    ./scripts/config --disable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+    ./scripts/config --disable DEBUG_INFO_BTF
+    ./scripts/config --disable DEBUG_INFO_BTF_MODULES
+fi
+
+# --- Preemption, Timers, IKCONFIG, Security LSM's ---
+./scripts/config --enable IKCONFIG
+./scripts/config --enable IKCONFIG_PROC
+./scripts/config --enable PREEMPT_DYNAMIC
+./scripts/config --enable PREEMPT
+./scripts/config --enable HZ_1000
+./scripts/config --enable SECURITY_LANDLOCK
+./scripts/config --enable SECURITY_YAMA
+./scripts/config --enable SECURITY_LOCKDOWN_LSM
+./scripts/config --enable SECURITY_DMESG_RESTRICT
+./scripts/config --enable BPF_SYSCALL
+./scripts/config --enable BPF_JIT
+./scripts/config --enable CGROUPS
+./scripts/config --enable NAMESPACES
+./scripts/config --enable SECCOMP
+
+# --- Overbodige legacy/niche bloat uitschakelen (in beide modes!) ---
+for opt in \
+    STAGING INFINIBAND ISDN HAMRADIO MEDIA_SUPPORT COMEDI NFC WIMAX CAN ATM \
+    APPLETALK IEEE802154 6LOWPAN BATMAN_ADV FIREWIRE PARPORT PCCARD PCMCIA \
+    ISAPNP EISA KUNIT SAMPLE_TRACE_EVENTS DEBUG_KERNEL_TEST; do
+    ./scripts/config --disable "$opt" 2>/dev/null || true
+done
+
+# --- Essentiële KaaijkOS boot-, Live-ISO-, VM-, storage-, netwerk- & UFW-modules garanderen ---
+for mod_y in \
+    EXT4_FS BTRFS_FS VIRTIO VIRTIO_PCI VIRTIO_BLK VIRTIO_CONSOLE VIRTIO_FS \
+    SCSI_VIRTIO BLK_DEV_SD EFI EFI_STUB EFIVAR_FS FB_EFI FB_VESA DRM_SIMPLEDRM \
+    DEVTMPFS DEVTMPFS_MOUNT TMPFS_POSIX_ACL FHANDLE AUTOFS_FS; do
+    ./scripts/config --enable "$mod_y" 2>/dev/null || true
+done
+
+for mod_m in \
+    VFAT_FS FAT_FS NLS_CP437 NLS_ISO8859_1 ISO9660_FS SQUASHFS OVERLAY_FS FUSE_FS \
+    EXFAT_FS XFS_FS BLK_DEV_LOOP BLK_DEV_SR CDROM CHR_DEV_SG ZRAM \
+    BLK_DEV_NVME NVME_CORE SATA_AHCI ATA_PIIX ATA_GENERIC PATA_ACPI \
+    USB_STORAGE USB_UAS USB_XHCI_HCD USB_XHCI_PCI USB_EHCI_HCD USB_EHCI_PCI \
+    USB_UHCI_HCD USB_OHCI_HCD USB_OHCI_PCI USB_HID HID_GENERIC \
+    VIRTIO_NET VIRTIO_BALLOON DRM_BOCHS DRM_VIRTIO_GPU DRM_VMWGFX \
+    VMWARE_PVSCSI VMWARE_BALLOON VMXNET3 E1000 E1000E IGB R8169 \
+    VSOCKETS VIRTIO_VSOCKETS VSOCKETS_LOOPBACK \
+    BRIDGE VETH TUN WIREGUARD MACVLAN VXLAN \
+    NF_TABLES NFT_COMPAT NFT_LIMIT NFT_CT NFT_REJECT NFT_LOG NF_CONNTRACK NF_LOG_SYSLOG \
+    NF_REJECT_IPV4 NF_REJECT_IPV6 IP_NF_IPTABLES IP6_NF_IPTABLES \
+    IP_NF_FILTER IP6_NF_FILTER IP_NF_NAT IP6_NF_NAT \
+    IP_NF_TARGET_REJECT IP6_NF_TARGET_REJECT IP6_NF_MATCH_RT \
+    NETFILTER_XT_MATCH_CONNTRACK NETFILTER_XT_MATCH_STATE NETFILTER_XT_MATCH_LIMIT \
+    NETFILTER_XT_MATCH_ADDRTYPE NETFILTER_XT_MATCH_HL NETFILTER_XT_MATCH_MULTIPORT \
+    NETFILTER_XT_MATCH_COMMENT NETFILTER_XT_TARGET_LOG \
+    INET_DIAG INET_TCP_DIAG INET_UDP_DIAG; do
+    ./scripts/config --module "$mod_m" 2>/dev/null || true
+done
+for opt_y in \
+    SQUASHFS_ZSTD SQUASHFS_XZ SQUASHFS_LZ4 SQUASHFS_ZLIB \
+    ZRAM_BACKEND_ZSTD ZRAM_BACKEND_LZ4 ZRAM_DEF_COMP_ZSTD ZSWAP \
+    NF_TABLES_INET NF_TABLES_IPV4 NF_TABLES_IPV6; do
+    ./scripts/config --enable "$opt_y" 2>/dev/null || true
+done
+
+make olddefconfig >/dev/null
+
+if [ "$OPEN_MENUCONFIG" -eq 1 ]; then
+    make menuconfig
+fi
+
+cp -f .config "${WORKDIR}/kaaijkos-${VERSION}.config"
+MOD_COUNT=$(grep -c '=m$' .config || true)
+Y_COUNT=$(grep -c '=y$' .config || true)
+echo "  Config opgeslagen: ${WORKDIR}/kaaijkos-${VERSION}.config (${Y_COUNT} built-in, ${MOD_COUNT} modules)"
+
+# ---- 4. Compileren ----
+echo "[5/7] Kernel & modules compileren met -j${JOBS} (KBUILD_BUILD_USER=kaaijkos)..."
+START_TS=$(date +%s)
+
+export KBUILD_BUILD_USER="kaaijkos"
+export KBUILD_BUILD_HOST="build"
+
+make -j"${JOBS}" bzImage modules
+
+KREL=$(make -s kernelrelease)
+END_TS=$(date +%s)
+echo "  Compilatie geslaagd voor ${KREL} in $(( (END_TS - START_TS) / 60 ))m $(( (END_TS - START_TS) % 60 ))s!"
+
+# ---- 5. Modules installeren (eerst strippen, daarna signen -> 0 taint!) ----
+echo "[6/7] Modules installeren & signen naar /usr/lib/modules/${KREL}..."
+make INSTALL_MOD_STRIP=1 INSTALL_MOD_PATH=/usr modules_install
+cp -f arch/x86/boot/bzImage "/usr/lib/modules/${KREL}/vmlinuz"
+depmod -a "${KREL}"
+
+# ---- 6. Veilige installatie in /boot met automatische fallback + GRUB ----
+echo "[7/7] Kernel, initramfs & GRUB bijwerken (met fallback naar vorige kernel)..."
+
+if [ -f /boot/vmlinuz-kaaijkos ]; then
+    cp -f /boot/vmlinuz-kaaijkos /boot/vmlinuz-kaaijkos.prev
+fi
+if [ -f /boot/initramfs-kaaijkos.img ]; then
+    cp -f /boot/initramfs-kaaijkos.img /boot/initramfs-kaaijkos.prev.img
+fi
+
+cp -f arch/x86/boot/bzImage /boot/vmlinuz-kaaijkos
+cp -f .config "/boot/config-${KREL}"
+
+# Preset bijwerken voor mkinitcpio
+mkdir -p /etc/mkinitcpio.d
+cat << PRESET > /etc/mkinitcpio.d/linux-kaaijkos.preset
+ALL_config="/etc/mkinitcpio.conf"
+ALL_kver="/usr/lib/modules/${KREL}/vmlinuz"
+PRESETS=('default')
+default_image="/boot/initramfs-kaaijkos.img"
+PRESET
+
+# Initramfs genereren
+mkinitcpio -k "${KREL}" -c /etc/mkinitcpio.conf -g /boot/initramfs-kaaijkos.img
+
+# Validatie voor we GRUB aanpassen
+if [ ! -s /boot/vmlinuz-kaaijkos ] || [ ! -s /boot/initramfs-kaaijkos.img ]; then
+    echo "FOUT: vmlinuz of initramfs is leeg! Herstel vorige kernel..." >&2
+    [ -f /boot/vmlinuz-kaaijkos.prev ] && mv -f /boot/vmlinuz-kaaijkos.prev /boot/vmlinuz-kaaijkos
+    [ -f /boot/initramfs-kaaijkos.prev.img ] && mv -f /boot/initramfs-kaaijkos.prev.img /boot/initramfs-kaaijkos.img
+    exit 1
+fi
+
+# GRUB configuratie met fallback-entry bijwerken
+ROOT_UUID=$(findmnt -no UUID /)
+if [ -d /boot/grub ] && [ -n "$ROOT_UUID" ]; then
+    cat << GRUBEOF > /boot/grub/grub.cfg
+set default=0
+set timeout=3
+
+menuentry "KaaijkOS 1.0 (Linux ${KREL})" {
+    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
+    linux /boot/vmlinuz-kaaijkos root=UUID=${ROOT_UUID} rw rootfstype=ext4 quiet loglevel=3
+    initrd /boot/initramfs-kaaijkos.img
+}
+
+menuentry "KaaijkOS 1.0 (Fallback / Vorige Kernel)" {
+    search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
+    linux /boot/vmlinuz-kaaijkos.prev root=UUID=${ROOT_UUID} rw rootfstype=ext4
+    initrd /boot/initramfs-kaaijkos.prev.img
+}
+GRUBEOF
+    echo "  /boot/grub/grub.cfg bijgewerkt met standaard + fallback menuentry."
+fi
+
+echo ""
+echo "================================================================================"
+echo "  KLAAR! Eigen KaaijkOS kernel geinstalleerd: ${KREL}"
+echo "  Kernel    : /boot/vmlinuz-kaaijkos ($(du -h /boot/vmlinuz-kaaijkos | awk '{print $1}'))"
+echo "  Initramfs : /boot/initramfs-kaaijkos.img ($(du -h /boot/initramfs-kaaijkos.img | awk '{print $1}'))"
+echo "  Modules   : /usr/lib/modules/${KREL} ($(find "/usr/lib/modules/${KREL}" -name '*.ko*' | wc -l) modules)"
+echo "  Key       : ${SIGN_KEY}"
+echo "  Fallback  : /boot/vmlinuz-kaaijkos.prev"
+echo ""
+echo "  Herstart nu met 'reboot' en controleer daarna met:"
+echo "    uname -a"
+echo "    cat /proc/version"
+echo "    cat /proc/sys/kernel/tainted     # moet 0 zijn!"
+echo "    dmesg | grep -iE 'taint|qr_code|KaaijkOS|X\.509'"
+echo "================================================================================"

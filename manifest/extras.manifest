@@ -1,0 +1,8 @@
+# KaaijkOS 1.0 — Extra upstream bronnen (eigen Linux 7.3.6 kernel + Ronde 10 net/SSH/boot essentials)
+# Formaat: <EXPECTED_MD5_OR_->  <FILENAME>  <URL>
+-  linux-7.3.6.tar.xz       https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.3.6.tar.xz
+-  cacert.pem               https://curl.se/ca/cacert.pem
+-  curl-8.21.0.tar.xz       https://curl.se/download/curl-8.21.0.tar.xz
+-  openssh-10.5p1.tar.gz    https://ftp.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-10.5p1.tar.gz
+-  dosfstools-4.2.tar.gz    https://github.com/dosfstools/dosfstools/releases/download/v4.2/dosfstools-4.2.tar.gz
+-  nano-9.2.tar.xz          https://www.nano-editor.org/dist/v9/nano-9.2.tar.xz

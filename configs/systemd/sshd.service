@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenSSH Daemon (KaaijkOS)
+After=network.target sshd-keygen.service
+Wants=sshd-keygen.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/sshd -D
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

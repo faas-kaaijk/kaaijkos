@@ -1,5 +1,12 @@
+*.tar.*
+*.tar
 *.img
 *.iso
-*.tar.zst
-*.sfs
-/work/
+*.pem
+*.key
+build/
+stage/
+work/
+backups/
+releases/
+.DS_Store
