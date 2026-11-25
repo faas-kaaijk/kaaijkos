@@ -1,0 +1,54 @@
+# KaaijkOS 1.1 GRUB Theme
+title-text: ""
+desktop-color: "#090d16"
+desktop-image: "background.png"
+desktop-image-scale-method: "crop"
+desktop-image-h-align: "center"
+desktop-image-v-align: "center"
+
+terminal-font: "Cascadia Mono 16"
+terminal-box: "terminal_*.png"
+terminal-left: "10%"
+terminal-top: "12%"
+terminal-width: "80%"
+terminal-height: "76%"
+terminal-border: "12"
+
++ image {
+    left = 50%-170
+    top = 50%-265
+    width = 340
+    height = 134
+    file = "logo.png"
+}
+
++ boot_menu {
+    left = 50%-300
+    top = 50%-110
+    width = 600
+    height = 312
+    item_font = "Roboto Regular 18"
+    selected_item_font = "Roboto Regular 18"
+    item_color = "#cbd5e1"
+    selected_item_color = "#ffffff"
+    icon_width = 24
+    icon_height = 24
+    item_icon_space = 16
+    item_height = 32
+    item_padding = 10
+    item_spacing = 10
+    menu_pixmap_style = "menu_*.png"
+    selected_item_pixmap_style = "select_*.png"
+    scrollbar = false
+}
+
++ label {
+    left = 0
+    top = 91%
+    width = 100%
+    height = 28
+    align = "center"
+    font = "Roboto Regular 14"
+    color = "#94a3b8"
+    text = "↑↓ Select   ·   Enter Boot   ·   e Edit   ·   c Console"
+}

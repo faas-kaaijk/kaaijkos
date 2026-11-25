@@ -36,8 +36,8 @@ unset _f
 ADD_PROF
 fi
 
-kpkg pack "$S" kaaijkos-motd 1.1
-kpkg install /var/cache/kpkg/kaaijkos-motd-1.1.kpkg.tar.zst
+kpkg pack "$S" kaaijkos-motd 1.2
+kpkg install /var/cache/kpkg/kaaijkos-motd-1.2.kpkg.tar.zst
 rm -rf "$S"
 
 echo "=== Veilig pre-login /etc/issue (zonder interne systeeminfo) ==="
@@ -81,7 +81,6 @@ right = {
     6: f"{W}IP    {R}: \\4",
     7: f"{W}TTY   {R}: \\l",
     8: f"{D}------------------------------{R}",
-    9: f"{D}Geautoriseerde toegang alleen.{R}",
 }
 lines = ["\x1b[H\x1b[2J"]
 for i, raw in enumerate(LOGO):
@@ -125,6 +124,36 @@ __kaaijkos_prompt() {
 
 PROMPT_COMMAND=__kaaijkos_prompt
 BASHRC_EOF
+
+systemctl is-system-running >/dev/null 2>&1 && systemctl daemon-reload || true
+if [ -f /work/tools/kaaijkos-greeter ] && [ -f /work/configs/systemd/getty@tty1.service.d/kaaijkos-greeter.conf ]; then
+    echo "=== KaaijkOS TUI Greeter (tty1 met Herstarten & Afsluiten) ==="
+    S=/work/stage/kaaijkos-greeter
+    rm -rf "$S"
+    mkdir -p "$S/usr/bin" "$S/etc/systemd/system/getty@tty1.service.d"
+    install -m 755 /work/tools/kaaijkos-greeter "$S/usr/bin/kaaijkos-greeter"
+    install -m 644 /work/configs/systemd/getty@tty1.service.d/kaaijkos-greeter.conf \
+        "$S/etc/systemd/system/getty@tty1.service.d/kaaijkos-greeter.conf"
+    kpkg pack "$S" kaaijkos-greeter 1.2
+    kpkg install /var/cache/kpkg/kaaijkos-greeter-1.2.kpkg.tar.zst
+    rm -rf "$S"
+    systemctl is-system-running >/dev/null 2>&1 && systemctl daemon-reload || true
+fi
+
+if [ -f /work/tools/kaaijkos-cli-splash ] && [ -f /work/configs/systemd/kaaijkos-cli-splash.service ]; then
+    echo "=== KaaijkOS CLI Boot Splash (voor CLI boot entry zonder Plymouth) ==="
+    S=/work/stage/kaaijkos-cli-splash
+    rm -rf "$S"
+    mkdir -p "$S/usr/bin" "$S/etc/systemd/system"
+    install -m 755 /work/tools/kaaijkos-cli-splash "$S/usr/bin/kaaijkos-cli-splash"
+    install -m 644 /work/configs/systemd/kaaijkos-cli-splash.service \
+        "$S/etc/systemd/system/kaaijkos-cli-splash.service"
+    kpkg pack "$S" kaaijkos-cli-splash 1.1
+    kpkg install /var/cache/kpkg/kaaijkos-cli-splash-1.1.kpkg.tar.zst
+    rm -rf "$S"
+    systemctl is-system-running >/dev/null 2>&1 && systemctl daemon-reload || true
+    systemctl enable kaaijkos-cli-splash.service 2>/dev/null || true
+fi
 
 systemctl is-system-running >/dev/null 2>&1 && systemctl restart getty@tty1.service || true
 echo "=== Fase 5b KLAAR! ==="

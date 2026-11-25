@@ -91,7 +91,6 @@ right = {
     6: f"{W}IP    {R}: \\4",
     7: f"{W}TTY   {R}: \\l",
     8: f"{D}------------------------------{R}",
-    9: f"{D}Geautoriseerde toegang alleen.{R}",
 }
 lines = ["\x1b[H\x1b[2J"]
 for i, raw in enumerate(LOGO):
@@ -199,28 +198,102 @@ grub-install --target=x86_64-efi \
              --bootloader-id=KaaijkOS \
              --no-nvram
 
-echo "=== [4/4] Schone /boot/grub/grub.cfg genereren ==="
+echo "=== [4/4] KaaijkOS GRUB thema + schone /boot/grub/grub.cfg genereren ==="
+if [ -d /work/assets/grub-theme ]; then
+    S=/work/stage/kaaijkos-grub-theme
+    rm -rf "$S"
+    mkdir -p "$S/boot/grub/themes/kaaijkos"
+    cp -a /work/assets/grub-theme/. "$S/boot/grub/themes/kaaijkos/"
+    chmod -R a+rX "$S/boot/grub/themes/kaaijkos"
+    kpkg pack "$S" kaaijkos-grub-theme 1.4
+    kpkg install /var/cache/kpkg/kaaijkos-grub-theme-1.4.kpkg.tar.zst
+    rm -rf "$S"
+fi
+
 cat > /boot/grub/grub.cfg << EOF
 set default=0
-set timeout=5
 
 insmod part_gpt
 insmod ext2
-insmod all_video
+if [ "\$grub_platform" = "efi" ]; then
+    insmod efi_gop
+    insmod efi_uga
+else
+    insmod all_video
+fi
+insmod font
+insmod gfxterm
+insmod gfxmenu
+insmod png
+insmod keystatus
+insmod sleep
 
 search --no-floppy --fs-uuid --set=root ${ROOT_UUID}
+
+set gfxmode=auto
+set gfxpayload=keep
 
 set menu_color_normal=light-cyan/black
 set menu_color_highlight=black/light-cyan
 
-menuentry "KaaijkOS 1.1 (Linux 7.3.6-kaaijkos)" {
-    linux  /boot/vmlinuz-kaaijkos root=UUID=${ROOT_UUID} ro
+if [ -f (memdisk)/fonts/kaaijkos-mono-16.pf2 ]; then
+    loadfont (memdisk)/fonts/kaaijkos-mono-16.pf2
+    loadfont (memdisk)/fonts/kaaijkos-sans-18.pf2
+    loadfont (memdisk)/fonts/kaaijkos-sans-14.pf2
+elif [ -f /boot/grub/themes/kaaijkos/kaaijkos-mono-16.pf2 ]; then
+    loadfont /boot/grub/themes/kaaijkos/kaaijkos-mono-16.pf2
+    loadfont /boot/grub/themes/kaaijkos/kaaijkos-sans-18.pf2
+    loadfont /boot/grub/themes/kaaijkos/kaaijkos-sans-14.pf2
+fi
+
+if [ -f /boot/grub/themes/kaaijkos/theme.txt ]; then
+    terminal_output gfxterm
+    set theme=/boot/grub/themes/kaaijkos/theme.txt
+fi
+
+set timeout_style=hidden
+set timeout=2
+if keystatus --shift; then
+    set timeout_style=menu
+    set timeout=-1
+fi
+
+menuentry "KaaijkOS 1.1 (CLI)" --class cli {
+    set theme=""
+    background_color 9,13,22
+    clear
+    linux  /boot/vmlinuz-kaaijkos root=UUID=${ROOT_UUID} ro quiet kaaijkos.cli-splash loglevel=3 rd.udev.log_level=3 udev.log_level=3 systemd.show_status=false vt.global_cursor_default=0 systemd.unit=multi-user.target
     initrd /boot/initramfs-kaaijkos.img
 }
 
-menuentry "KaaijkOS 1.1 (Debug / Verbose Boot)" {
+menuentry "KaaijkOS 1.1 (Graphical)" --class kaaijkos {
+    set theme=""
+    background_color 9,13,22
+    if [ -f /boot/grub/themes/kaaijkos/boot-splash.png ]; then
+        background_image /boot/grub/themes/kaaijkos/boot-splash.png
+    fi
+    clear
+    linux  /boot/vmlinuz-kaaijkos root=UUID=${ROOT_UUID} ro quiet splash loglevel=3 rd.udev.log_level=3 udev.log_level=3 systemd.show_status=auto vt.global_cursor_default=0
+    initrd /boot/initramfs-kaaijkos.img
+}
+
+menuentry "KaaijkOS 1.1 (Debug / Verbose Boot)" --class debug {
     linux  /boot/vmlinuz-kaaijkos root=UUID=${ROOT_UUID} ro loglevel=7
     initrd /boot/initramfs-kaaijkos.img
+}
+
+if [ "\$grub_platform" = "efi" ]; then
+    menuentry "UEFI Firmware Settings" --class uefi {
+        fwsetup
+    }
+fi
+
+menuentry "Reboot" --class restart {
+    reboot
+}
+
+menuentry "Power Off" --class shutdown {
+    halt
 }
 EOF
 

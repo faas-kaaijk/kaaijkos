@@ -157,7 +157,25 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t tmpfs tmpfs /run
 
-echo "[KaaijkOS] Initramfs gestart — hardware detecteren..."
+QUIET=0
+ROOT_SPEC=""
+ROOT_FSTYPE=""
+ROOT_FLAGS="ro"
+INIT_BIN="/sbin/init"
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        quiet)        QUIET=1 ;;
+        root=*)       ROOT_SPEC="${arg#root=}" ;;
+        rootfstype=*) ROOT_FSTYPE="${arg#rootfstype=}" ;;
+        rootflags=*)  ROOT_FLAGS="${arg#rootflags=}" ;;
+        init=*)       INIT_BIN="${arg#init=}" ;;
+        rw)           ROOT_FLAGS="rw" ;;
+        ro)           ROOT_FLAGS="ro" ;;
+    esac
+done
+
+log() { [ "$QUIET" -eq 0 ] && echo "$*"; }
+log "[KaaijkOS] Initramfs started - detecting hardware..."
 
 load_hw() {
     for m in virtio_pci virtio_scsi virtio_blk ahci nvme sd_mod sr_mod \
@@ -177,21 +195,6 @@ load_hw() {
         done
     done
 }
-
-ROOT_SPEC=""
-ROOT_FSTYPE=""
-ROOT_FLAGS="ro"
-INIT_BIN="/sbin/init"
-for arg in $(cat /proc/cmdline); do
-    case "$arg" in
-        root=*)       ROOT_SPEC="${arg#root=}" ;;
-        rootfstype=*) ROOT_FSTYPE="${arg#rootfstype=}" ;;
-        rootflags=*)  ROOT_FLAGS="${arg#rootflags=}" ;;
-        init=*)       INIT_BIN="${arg#init=}" ;;
-        rw)           ROOT_FLAGS="rw" ;;
-        ro)           ROOT_FLAGS="ro" ;;
-    esac
-done
 
 load_hw
 
@@ -215,13 +218,13 @@ while [ "$i" -lt 75 ]; do
 done
 
 if [ -z "$ROOT_DEV" ] || [ ! -b "$ROOT_DEV" ]; then
-    echo "!!! [KaaijkOS] Root device '$ROOT_SPEC' niet gevonden! Rescue shell:"
+    echo "!!! [KaaijkOS] Root device '$ROOT_SPEC' not found! Rescue shell:"
     blkid || true
     ls -l /dev/sd* /dev/vd* /dev/nvme* 2>/dev/null || true
     exec /bin/sh
 fi
 
-echo "[KaaijkOS] Mount root: $ROOT_DEV ($ROOT_FLAGS)"
+log "[KaaijkOS] Mounting root: $ROOT_DEV ($ROOT_FLAGS)"
 if [ -n "$ROOT_FSTYPE" ]; then
     mount -t "$ROOT_FSTYPE" -o "$ROOT_FLAGS" "$ROOT_DEV" /newroot || exec /bin/sh
 else
@@ -229,7 +232,7 @@ else
 fi
 
 [ -x "/newroot$INIT_BIN" ] || INIT_BIN="/usr/lib/systemd/systemd"
-echo "[KaaijkOS] Start $INIT_BIN..."
+log "[KaaijkOS] Starting $INIT_BIN..."
 exec switch_root /newroot "$INIT_BIN"
 INIT_EOF
 chmod 755 "$WORK/init"

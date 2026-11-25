@@ -77,7 +77,7 @@ grub,5,Free Software Foundation,grub,2.14,https://www.gnu.org/software/grub/
 grub.kaaijkos,1,KaaijkOS,grub,2.14-kaaijkos,https://github.com/faas-kaaijk/kaaijkos
 SBAT
 
-echo "=== [4/5] /usr/bin/kaaijkos-sign-boot (v1.2) installeren via kpkg ==="
+echo "=== [4/5] /usr/bin/kaaijkos-sign-boot (v1.5) installeren via kpkg ==="
 S=/work/stage/kaaijkos-secureboot
 rm -rf "$S"
 mkdir -p "$S/usr/bin"
@@ -86,7 +86,7 @@ if [ -f /work/tools/kaaijkos-sign-boot ]; then
 else
     cat << 'SIGNTOOL_EOF' > "$S/usr/bin/kaaijkos-sign-boot"
 #!/usr/bin/env bash
-# KaaijkOS 1.1 — Bouwt SBAT GRUB 2.14 + signeert GRUB & kernel veilig via /tmp
+# KaaijkOS 1.1 — Bouwt SBAT GRUB 2.14 (v1.5) + embedded fonts + signeert GRUB & kernel veilig via /tmp
 set -euo pipefail
 
 MOK_KEY="/etc/kernel/kaaijkos-mok.key"
@@ -132,26 +132,50 @@ PY
 }
 
 WANT_MODS="part_gpt part_msdos fat ext2 btrfs xfs iso9660 squash4 \
+           memdisk tar \
            search search_fs_uuid search_label search_fs_file \
-           normal configfile linux boot chain echo test true \
-           all_video efi_gop efi_uga video_bochs video_cirrus gfxterm font \
-           gzio zstd ls cat help reboot halt sleep tpm"
+           normal configfile linux boot chain echo test true loadenv \
+           keystatus sleep efifwsetup \
+           efi_gop efi_uga video video_fb video_colors \
+           font bitmap bitmap_scale trig png jpeg tga gfxterm gfxterm_background gfxmenu \
+           gzio zstd ls cat help reboot halt tpm"
 MODS=""
 for m in $WANT_MODS; do
     [ -f "/usr/lib/grub/x86_64-efi/${m}.mod" ] && MODS="${MODS} ${m}"
 done
 MODS="${MODS# }"
 
-echo "[kaaijkos-sign-boot] Bouw zelfstandige SBAT GRUB 2.14 EFI image..."
-grub-install --target=x86_64-efi \
-             --efi-directory=/boot/efi \
-             --bootloader-id=KaaijkOS \
-             --no-nvram \
-             --sbat=/etc/grub/sbat.csv \
-             --modules="$MODS"
+ROOT_DEV="$(findmnt -no SOURCE / 2>/dev/null || awk '$2=="/"{print $1}' /proc/mounts | tail -n1)"
+ROOT_UUID="$(blkid -s UUID -o value "$ROOT_DEV" 2>/dev/null || findmnt -no UUID / 2>/dev/null || true)"
+[ -n "$ROOT_UUID" ] || { echo "FOUT: kon ROOT_UUID van / ($ROOT_DEV) niet bepalen!"; exit 1; }
+
+cat > "$TMP/load.cfg" << LOADCFG
+search.fs_uuid ${ROOT_UUID} root
+set prefix=(\$root)'/boot/grub'
+LOADCFG
+
+MEMDISK_ARGS=()
+if ls /boot/grub/themes/kaaijkos/*.pf2 >/dev/null 2>&1; then
+    mkdir -p "$TMP/memdisk/fonts"
+    cp -f /boot/grub/themes/kaaijkos/*.pf2 "$TMP/memdisk/fonts/"
+    tar --format=ustar -C "$TMP/memdisk" -cf "$TMP/fonts.tar" fonts
+    MEMDISK_ARGS=(--memdisk "$TMP/fonts.tar")
+    echo "[kaaijkos-sign-boot] Ingebedde memdisk-fonts: $(ls -1 "$TMP/memdisk/fonts" | tr '\n' ' ')"
+fi
+
+echo "[kaaijkos-sign-boot] Bouw zelfstandige SBAT GRUB 2.14 EFI image (ROOT_UUID=${ROOT_UUID})..."
+# shellcheck disable=SC2086
+grub-mkimage \
+    -O x86_64-efi \
+    -d /usr/lib/grub/x86_64-efi \
+    -c "$TMP/load.cfg" \
+    "${MEMDISK_ARGS[@]}" \
+    -p /boot/grub \
+    --sbat=/etc/grub/sbat.csv \
+    -o "$TMP/grubx64.efi.unsigned" \
+    $MODS
 
 echo "[kaaijkos-sign-boot] Signeer grubx64.efi veilig in /tmp (niet direct op FAT32)..."
-cp -f /boot/efi/EFI/KaaijkOS/grubx64.efi "$TMP/grubx64.efi.unsigned"
 "$SBSIGN" sign \
     --private-key "$MOK_KEY" \
     --certificate "$MOK_CRT" \
@@ -191,14 +215,15 @@ echo "[kaaijkos-sign-boot] Eindverificatie op schijf:"
 verify_pe_sig /boot/efi/EFI/BOOT/grubx64.efi
 verify_pe_sig /boot/vmlinuz-kaaijkos
 echo "=== SBAT ==="
-objcopy --dump-section .sbat=/dev/stdout "$TMP/grubx64.efi.unsigned" /dev/null
+objcopy -O binary --only-section=.sbat "$TMP/grubx64.efi.unsigned" "$TMP/sbat.out"
+cat "$TMP/sbat.out"
 echo ""
 SIGNTOOL_EOF
 fi
 
 chmod 755 "$S/usr/bin/kaaijkos-sign-boot"
-kpkg pack "$S" kaaijkos-secureboot 1.2
-kpkg install /var/cache/kpkg/kaaijkos-secureboot-1.2.kpkg.tar.zst
+kpkg pack "$S" kaaijkos-secureboot 1.5
+kpkg install /var/cache/kpkg/kaaijkos-secureboot-1.5.kpkg.tar.zst
 rm -rf "$S"
 
 echo "=== [5/5] Eerste keer signeren & installeren uitvoeren ==="

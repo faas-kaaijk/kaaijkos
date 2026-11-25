@@ -1,0 +1,18 @@
+[Unit]
+Description=KaaijkOS CLI Boot Splash
+DefaultDependencies=no
+ConditionKernelCommandLine=kaaijkos.cli-splash
+After=sysinit.target systemd-vconsole-setup.service
+Before=getty@tty1.service multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/kaaijkos-cli-splash
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+
+[Install]
+WantedBy=multi-user.target

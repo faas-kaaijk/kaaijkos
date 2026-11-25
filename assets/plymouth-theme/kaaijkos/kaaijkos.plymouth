@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=KaaijkOS
+Description=KaaijkOS 1.1 Flicker-Free Boot Splash with K-Logo Spinner
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/kaaijkos
+ScriptFile=/usr/share/plymouth/themes/kaaijkos/kaaijkos.script

@@ -1,0 +1,102 @@
+# KaaijkOS 1.1 Plymouth Script — Flicker-free logo + K-based spinner
+Window.SetBackgroundTopColor(0.0353, 0.0510, 0.0863);
+Window.SetBackgroundBottomColor(0.0353, 0.0510, 0.0863);
+
+win_w = Window.GetWidth();
+win_h = Window.GetHeight();
+
+# Match GRUB 800x600 boot-splash.png vertical scale cleanly (1:1 on 800x600, uniform on 1024x768+)
+raw_logo = Image("logo.png");
+scale = win_h / 600.0;
+if (scale < 0.85) scale = 0.85;
+if (scale > 1.65) scale = 1.65;
+
+logo_w = Math.Int(raw_logo.GetWidth() * scale);
+logo_h = Math.Int(raw_logo.GetHeight() * scale);
+logo_img = raw_logo.Scale(logo_w, logo_h);
+
+logo_sprite = Sprite(logo_img);
+logo_sprite.SetX(Math.Int((win_w - logo_w) / 2));
+logo_sprite.SetY(Math.Int((win_h - logo_h) / 2));
+logo_sprite.SetZ(10);
+
+# 36-frame K-inspired spinner right below the logo
+num_frames = 36;
+spinner_size = Math.Int(64 * scale);
+if (spinner_size < 48) spinner_size = 48;
+if (spinner_size > 96) spinner_size = 96;
+
+for (i = 0; i < num_frames; i++) {
+    if (i < 10)
+        fname = "spinner-0" + i + ".png";
+    else
+        fname = "spinner-" + i + ".png";
+    spinner_frames[i] = Image(fname).Scale(spinner_size, spinner_size);
+}
+
+spinner_sprite = Sprite(spinner_frames[0]);
+spinner_sprite.SetX(Math.Int((win_w - spinner_size) / 2));
+spinner_sprite.SetY(Math.Int((win_h + logo_h) / 2 + (32 * scale)));
+spinner_sprite.SetZ(20);
+
+# On boot, GRUB already drew the exact logo -> keep logo at 1.0 and fade-in spinner smoothly.
+# On shutdown/reboot, fade-in both logo and spinner together from 0.0 -> 1.0.
+mode = Plymouth.GetMode();
+logo_fade_in = (mode == "shutdown" || mode == "reboot");
+if (logo_fade_in)
+    logo_sprite.SetOpacity(0.0);
+else
+    logo_sprite.SetOpacity(1.0);
+spinner_sprite.SetOpacity(0.0);
+
+tick = 0;
+fade_in_ticks = 18;
+fade_out_active = 0;
+fade_out_tick = 0;
+fade_out_ticks = 20;
+
+fun ease_out(t) {
+    if (t <= 0.0) return 0.0;
+    if (t >= 1.0) return 1.0;
+    inv = 1.0 - t;
+    return 1.0 - (inv * inv * inv);
+}
+
+fun refresh_callback() {
+    tick++;
+    frame_idx = Math.Int(tick / 1.5) % num_frames;
+    spinner_sprite.SetImage(spinner_frames[frame_idx]);
+
+    if (fade_out_active) {
+        fade_out_tick++;
+        p = fade_out_tick / fade_out_ticks;
+        op = 1.0 - ease_out(p);
+        if (op < 0.0) op = 0.0;
+        logo_sprite.SetOpacity(op);
+        spinner_sprite.SetOpacity(op);
+    } else if (tick <= fade_in_ticks) {
+        op = ease_out(tick / fade_in_ticks);
+        spinner_sprite.SetOpacity(op);
+        if (logo_fade_in)
+            logo_sprite.SetOpacity(op);
+    } else {
+        spinner_sprite.SetOpacity(1.0);
+        logo_sprite.SetOpacity(1.0);
+    }
+}
+
+Plymouth.SetRefreshFunction(refresh_callback);
+
+fun status_callback(status) {
+    if (status == "fadeout") {
+        fade_out_active = 1;
+        fade_out_tick = 0;
+    }
+}
+Plymouth.SetUpdateStatusFunction(status_callback);
+
+fun quit_callback() {
+    logo_sprite.SetOpacity(0.0);
+    spinner_sprite.SetOpacity(0.0);
+}
+Plymouth.SetQuitFunction(quit_callback);

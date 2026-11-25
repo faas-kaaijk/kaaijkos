@@ -217,7 +217,7 @@ def get_uptime():
     if days:
         parts.append(f"{days}d")
     if hours:
-        parts.append(f"{hours}u")
+        parts.append(f"{hours}h")
     parts.append(f"{mins}m")
     load1, load5, load15 = open("/proc/loadavg").read().split()[:3]
     return f"{' '.join(parts)} {DIM}(load: {load1}, {load5}, {load15}){RESET}"
@@ -238,7 +238,7 @@ def get_ip():
             return ", ".join(addrs[:2])
     except Exception:
         pass
-    return f"{YELLOW}geen netwerk{RESET}"
+    return f"{YELLOW}no network{RESET}"
 
 
 def get_services_and_extras():
@@ -259,8 +259,8 @@ def get_services_and_extras():
         pass
 
     kpkg_cnt = len(glob.glob("/var/lib/kpkg/*.info"))
-    fail_str = f"{RED}{failed} gefaald{RESET}" if failed else f"{GREEN}0 gefaald{RESET}"
-    res = f"{GREEN}{active} actief{RESET} · {fail_str} · {CYAN}{kpkg_cnt} kpkg{RESET}"
+    fail_str = f"{RED}{failed} failed{RESET}" if failed else f"{GREEN}0 failed{RESET}"
+    res = f"{GREEN}{active} active{RESET} · {fail_str} · {CYAN}{kpkg_cnt} kpkg{RESET}"
 
     for runtime in ("docker", "podman"):
         if shutil.which(runtime):
@@ -284,9 +284,9 @@ def get_session_info():
     except Exception:
         tty = "tty"
     if ssh_conn:
-        cur = f"ssh vanaf {CYAN}{ssh_conn[0]}{RESET} {DIM}({tty}){RESET}"
+        cur = f"ssh from {CYAN}{ssh_conn[0]}{RESET} {DIM}({tty}){RESET}"
     else:
-        cur = f"lokaal {DIM}({tty}){RESET}"
+        cur = f"local {DIM}({tty}){RESET}"
 
     who_cnt = 1
     try:
@@ -298,7 +298,7 @@ def get_session_info():
         pass
 
     sess_col = YELLOW if who_cnt > 2 else DIM
-    return user, f"{cur} · {sess_col}{who_cnt} actief{RESET}"
+    return user, f"{cur} · {sess_col}{who_cnt} active{RESET}"
 
 
 def get_last_login():
@@ -311,7 +311,7 @@ def get_last_login():
         if len(lines) >= 2:
             cols = lines[1].split()
             if len(cols) >= 6:
-                return f"{cols[0]} vanaf {cols[2]} ({' '.join(cols[3:7])})"
+                return f"{cols[0]} from {cols[2]} ({' '.join(cols[3:7])})"
     except Exception:
         pass
     return None
@@ -347,20 +347,20 @@ def render(prev_cpu=None, clear_screen=False):
     rows = [
         f"{CYAN}{title}{RESET}  {DIM}({RESET}{WHITE}{user}{RESET}{DIM} @ {RESET}{CYAN}{host}{RESET}{DIM}){RESET}",
         f"{DIM}{'─' * 52}{RESET}",
-        f"{WHITE}Datum    {RESET}: {now}",
+        f"{WHITE}Date     {RESET}: {now}",
         f"{WHITE}Kernel   {RESET}: {kernel} {DIM}({RESET}{taint_str}{DIM}){RESET}",
         f"{WHITE}Boot     {RESET}: {get_boot_status()}",
         f"{WHITE}Uptime   {RESET}: {get_uptime()}",
         f"{WHITE}IP       {RESET}: {get_ip()}",
         f"{WHITE}CPU      {RESET}: {bar(cpu_pct)} {pct_color(cpu_pct)}{cpu_pct:4.1f}%{RESET} {DIM}({ncpu} cores{temp}){RESET}",
         f"{WHITE}RAM      {RESET}: {bar(mpct)} {pct_color(mpct)}{mpct:4.1f}%{RESET} ({fmt_bytes(mused)} / {fmt_bytes(mtot)}) · {swap_str}",
-        f"{WHITE}Schijf / {RESET}: {bar(dpct)} {pct_color(dpct)}{dpct:4.1f}%{RESET} ({fmt_bytes(dused)} / {fmt_bytes(dtot)}){efi_str}",
-        f"{WHITE}Systeem  {RESET}: {get_services_and_extras()}",
-        f"{WHITE}Sessie   {RESET}: {sess_str}",
+        f"{WHITE}Disk /   {RESET}: {bar(dpct)} {pct_color(dpct)}{dpct:4.1f}%{RESET} ({fmt_bytes(dused)} / {fmt_bytes(dtot)}){efi_str}",
+        f"{WHITE}System   {RESET}: {get_services_and_extras()}",
+        f"{WHITE}Session  {RESET}: {sess_str}",
     ]
     last_log = get_last_login()
     if last_log:
-        rows.append(f"{WHITE}Laatste  {RESET}: {DIM}{last_log}{RESET}")
+        rows.append(f"{WHITE}Last     {RESET}: {DIM}{last_log}{RESET}")
 
     buf = []
     if clear_screen:
@@ -390,7 +390,7 @@ def main():
         try:
             while True:
                 prev = render(prev_cpu=prev, clear_screen=True)
-                sys.stdout.write(f"  {DIM}[Live modus — ververst elke 1s · druk Ctrl+C om te stoppen]{RESET}\n")
+                sys.stdout.write(f"  {DIM}[Live mode — refreshing every 1s · press Ctrl+C to exit]{RESET}\n")
                 sys.stdout.flush()
                 time.sleep(1)
         except KeyboardInterrupt:
