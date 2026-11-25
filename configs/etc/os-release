@@ -1,7 +1,7 @@
 NAME="KaaijkOS"
-PRETTY_NAME="KaaijkOS 1.0 (Linux 7.3.6-kaaijkos)"
+PRETTY_NAME="KaaijkOS 1.1 (Linux 7.3.6-kaaijkos)"
 ID=kaaijkos
-VERSION="1.0"
-VERSION_ID="1.0"
+VERSION="1.1"
+VERSION_ID="1.1"
 ANSI_COLOR="1;36"
-HOME_URL="https://kaaijkos.local"
+HOME_URL="https://github.com/faas-kaaijk/kaaijkos"

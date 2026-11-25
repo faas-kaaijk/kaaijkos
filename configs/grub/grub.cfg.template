@@ -10,12 +10,12 @@ search --no-floppy --fs-uuid --set=root <ROOT_UUID>
 set menu_color_normal=light-cyan/black
 set menu_color_highlight=black/light-cyan
 
-menuentry "KaaijkOS 1.0 (Linux 7.3.6-kaaijkos)" {
+menuentry "KaaijkOS 1.1 (Linux 7.3.6-kaaijkos)" {
     linux  /boot/vmlinuz-kaaijkos root=UUID=<ROOT_UUID> ro
     initrd /boot/initramfs-kaaijkos.img
 }
 
-menuentry "KaaijkOS 1.0 (Debug / Verbose Boot)" {
+menuentry "KaaijkOS 1.1 (Debug / Verbose Boot)" {
     linux  /boot/vmlinuz-kaaijkos root=UUID=<ROOT_UUID> ro loglevel=7
     initrd /boot/initramfs-kaaijkos.img
 }

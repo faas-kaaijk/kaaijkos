@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""KaaijkOS 1.1 — Live MOTD & System Status Dashboard (motd / motd live / motd -w)"""
+import glob
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+LOGO_LINES = [
+    "                        -=----",
+    "            :--        =====--",
+    "         ---===      ++++====-",
+    "        --===++   =++++++++   ",
+    "        ==++*#%+=++++++++     ",
+    "        ++###++++++++++       ",
+    "        ##*++++++++++         ",
+    "        +++++***++====        ",
+    "        +++++++======+++++    ",
+    "        ==+++++ ===+++++++++  ",
+    "        -=====+    ++++++++===",
+    "            -==       +++====-",
+]
+
+RESET = "\x1b[0m"
+BOLD = "\x1b[1m"
+DIM = "\x1b[2m"
+CYAN = "\x1b[1;36m"
+GREEN = "\x1b[1;32m"
+YELLOW = "\x1b[1;33m"
+RED = "\x1b[1;31m"
+WHITE = "\x1b[1;37m"
+
+
+def get_os_title() -> str:
+    try:
+        vals = {}
+        with open("/etc/os-release", "r", encoding="utf-8") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    vals[k] = v.strip().strip('"')
+        ver = vals.get("VERSION_ID") or vals.get("VERSION")
+        name = vals.get("NAME", "KaaijkOS")
+        if ver:
+            return f"{name} {ver}"
+    except Exception:
+        pass
+    return "KaaijkOS 1.1"
+
+
+def use_truecolor() -> bool:
+    term = os.environ.get("TERM", "")
+    colorterm = os.environ.get("COLORTERM", "")
+    if "truecolor" in colorterm or "24bit" in colorterm:
+        return True
+    return term not in ("linux", "dumb", "")
+
+
+def lerp(c1, c2, t):
+    t = max(0.0, min(1.0, t))
+    return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
+
+
+def colorize_logo(truecolor: bool):
+    colored = []
+    for r, line in enumerate(LOGO_LINES):
+        out = []
+        for c, ch in enumerate(line):
+            if ch == " ":
+                out.append(" ")
+                continue
+            if truecolor:
+                if c <= 15:
+                    if r <= 5:
+                        rgb = lerp((255, 168, 0), (255, 62, 102), (r - 1) / 4.0)
+                    else:
+                        rgb = lerp((112, 82, 255), (0, 218, 255), (r - 6) / 5.0)
+                else:
+                    t = (c - 16) / 13.0
+                    if r <= 6:
+                        if t < 0.5:
+                            rgb = lerp((238, 66, 138), (64, 130, 255), t * 2.0)
+                        else:
+                            rgb = lerp((64, 130, 255), (0, 232, 255), (t - 0.5) * 2.0)
+                    else:
+                        if t < 0.5:
+                            rgb = lerp((255, 96, 78), (235, 70, 162), t * 2.0)
+                        else:
+                            rgb = lerp((235, 70, 162), (186, 72, 255), (t - 0.5) * 2.0)
+                out.append(f"\x1b[1;38;2;{rgb[0]};{rgb[1]};{rgb[2]}m{ch}")
+            else:
+                if c <= 15 and r <= 4:
+                    col = "\x1b[1;33m" if r <= 2 else "\x1b[1;31m"
+                elif c <= 15:
+                    col = "\x1b[1;34m" if r <= 8 else "\x1b[1;36m"
+                elif r <= 6:
+                    col = "\x1b[1;36m"
+                else:
+                    col = "\x1b[1;35m"
+                out.append(f"{col}{ch}")
+        out.append(RESET)
+        colored.append("".join(out))
+    return colored
+
+
+def pct_color(pct: float) -> str:
+    if pct >= 85:
+        return RED
+    if pct >= 60:
+        return YELLOW
+    return GREEN
+
+
+def bar(pct: float, width: int = 10) -> str:
+    filled = max(0, min(width, int(round(pct / 100.0 * width))))
+    col = pct_color(pct)
+    return f"{DIM}[{RESET}{col}{'█' * filled}{DIM}{'░' * (width - filled)}]{RESET}"
+
+
+def fmt_bytes(n: int) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return f"{n:.1f} {unit}" if unit in ("GiB", "TiB") else f"{int(round(n))} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} TiB"
+
+
+def read_cpu_sample():
+    with open("/proc/stat", "r") as f:
+        parts = [int(x) for x in f.readline().split()[1:]]
+    idle = parts[3] + parts[4]
+    total = sum(parts)
+    return idle, total
+
+
+def get_cpu_pct(prev=None):
+    if prev is None:
+        i1, t1 = read_cpu_sample()
+        time.sleep(0.30)
+        i2, t2 = read_cpu_sample()
+    else:
+        i1, t1 = prev
+        i2, t2 = read_cpu_sample()
+    dt = max(1, t2 - t1)
+    di = max(0, i2 - i1)
+    pct = 100.0 * (dt - di) / dt
+    return pct, (i2, t2)
+
+
+def get_cpu_temp():
+    for path in sorted(glob.glob("/sys/class/thermal/thermal_zone*/temp")):
+        try:
+            t = int(open(path).read().strip())
+            if 1000 < t < 130000:
+                return f" · {t // 1000}°C"
+        except Exception:
+            pass
+    return ""
+
+
+def get_mem_swap():
+    info = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            info[k] = int(v.strip().split()[0]) * 1024
+    mtot = info.get("MemTotal", 1)
+    mavail = info.get("MemAvailable", info.get("MemFree", 0))
+    mused = max(0, mtot - mavail)
+    mpct = 100.0 * mused / mtot
+
+    stot = info.get("SwapTotal", 0)
+    sfree = info.get("SwapFree", 0)
+    sused = max(0, stot - sfree)
+    if stot > 0:
+        spct = 100.0 * sused / stot
+        swap_str = f"Swap: {fmt_bytes(sused)}/{fmt_bytes(stot)} ({spct:.0f}%)"
+    else:
+        swap_str = f"{DIM}Swap: off{RESET}"
+    return mused, mtot, mpct, swap_str
+
+
+def get_disk(path: str):
+    st = os.statvfs(path)
+    tot = st.f_blocks * st.f_frsize
+    avail = st.f_bavail * st.f_frsize
+    used = max(0, tot - st.f_bfree * st.f_frsize)
+    pct = (100.0 * used / tot) if tot else 0.0
+    return used, tot, avail, pct
+
+
+def get_boot_status():
+    if not os.path.isdir("/sys/firmware/efi"):
+        return f"{CYAN}Legacy BIOS{RESET}"
+    sb_paths = glob.glob("/sys/firmware/efi/efivars/SecureBoot-*")
+    for p in sb_paths:
+        try:
+            data = open(p, "rb").read()
+            if len(data) >= 5:
+                if data[4] == 1:
+                    return f"{CYAN}UEFI{RESET} · {GREEN}Secure Boot ON{RESET}"
+                return f"{CYAN}UEFI{RESET} · {YELLOW}Secure Boot OFF{RESET}"
+        except Exception:
+            pass
+    return f"{CYAN}UEFI{RESET}"
+
+
+def get_uptime():
+    secs = int(float(open("/proc/uptime").read().split()[0]))
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins = rem // 60
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}u")
+    parts.append(f"{mins}m")
+    load1, load5, load15 = open("/proc/loadavg").read().split()[:3]
+    return f"{' '.join(parts)} {DIM}(load: {load1}, {load5}, {load15}){RESET}"
+
+
+def get_ip():
+    try:
+        out = subprocess.check_output(
+            ["ip", "-o", "-4", "addr", "show", "scope", "global"],
+            text=True, stderr=subprocess.DEVNULL, timeout=1
+        )
+        addrs = []
+        for line in out.strip().splitlines():
+            cols = line.split()
+            if len(cols) >= 4:
+                addrs.append(f"{cols[3].split('/')[0]} {DIM}({cols[1]}){RESET}")
+        if addrs:
+            return ", ".join(addrs[:2])
+    except Exception:
+        pass
+    return f"{YELLOW}geen netwerk{RESET}"
+
+
+def get_services_and_extras():
+    active, failed = 0, 0
+    try:
+        out = subprocess.check_output(
+            ["systemctl", "list-units", "--type=service", "--no-legend", "--no-pager"],
+            text=True, stderr=subprocess.DEVNULL, timeout=1.5
+        )
+        for line in out.splitlines():
+            cols = line.split()
+            if len(cols) >= 4:
+                if cols[2] == "active" and cols[3] == "running":
+                    active += 1
+                elif cols[2] == "failed":
+                    failed += 1
+    except Exception:
+        pass
+
+    kpkg_cnt = len(glob.glob("/var/lib/kpkg/*.info"))
+    fail_str = f"{RED}{failed} gefaald{RESET}" if failed else f"{GREEN}0 gefaald{RESET}"
+    res = f"{GREEN}{active} actief{RESET} · {fail_str} · {CYAN}{kpkg_cnt} kpkg{RESET}"
+
+    for runtime in ("docker", "podman"):
+        if shutil.which(runtime):
+            try:
+                out = subprocess.check_output(
+                    [runtime, "ps", "-q"], text=True, stderr=subprocess.DEVNULL, timeout=1
+                )
+                cnt = len([l for l in out.splitlines() if l.strip()])
+                res += f" · {CYAN}{runtime}: {cnt} up{RESET}"
+                break
+            except Exception:
+                pass
+    return res
+
+
+def get_session_info():
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "root"
+    ssh_conn = os.environ.get("SSH_CONNECTION", "").split()
+    try:
+        tty = os.ttyname(0).replace("/dev/", "")
+    except Exception:
+        tty = "tty"
+    if ssh_conn:
+        cur = f"ssh vanaf {CYAN}{ssh_conn[0]}{RESET} {DIM}({tty}){RESET}"
+    else:
+        cur = f"lokaal {DIM}({tty}){RESET}"
+
+    who_cnt = 1
+    try:
+        out = subprocess.check_output(["who"], text=True, stderr=subprocess.DEVNULL, timeout=1)
+        lines = [l for l in out.splitlines() if l.strip()]
+        if lines:
+            who_cnt = len(lines)
+    except Exception:
+        pass
+
+    sess_col = YELLOW if who_cnt > 2 else DIM
+    return user, f"{cur} · {sess_col}{who_cnt} actief{RESET}"
+
+
+def get_last_login():
+    try:
+        out = subprocess.check_output(
+            ["last", "-n", "2", "-w", "--time-format=short"],
+            text=True, stderr=subprocess.DEVNULL, timeout=1
+        )
+        lines = [l.strip() for l in out.splitlines() if l.strip() and not l.startswith("wtmp")]
+        if len(lines) >= 2:
+            cols = lines[1].split()
+            if len(cols) >= 6:
+                return f"{cols[0]} vanaf {cols[2]} ({' '.join(cols[3:7])})"
+    except Exception:
+        pass
+    return None
+
+
+def render(prev_cpu=None, clear_screen=False):
+    tc = use_truecolor()
+    logo = colorize_logo(tc)
+
+    title = get_os_title()
+    host = socket.gethostname()
+    user, sess_str = get_session_info()
+    now = datetime.now().strftime("%a %d %b %Y · %H:%M:%S")
+    kernel = os.uname().release
+    try:
+        tainted = open("/proc/sys/kernel/tainted").read().strip()
+    except Exception:
+        tainted = "?"
+    taint_str = f"{GREEN}tainted: 0{RESET}" if tainted == "0" else f"{YELLOW}tainted: {tainted}{RESET}"
+
+    cpu_pct, next_cpu = get_cpu_pct(prev_cpu)
+    ncpu = os.cpu_count() or 1
+    temp = get_cpu_temp()
+
+    mused, mtot, mpct, swap_str = get_mem_swap()
+    dused, dtot, _, dpct = get_disk("/")
+    efi_str = ""
+    if os.path.ismount("/boot/efi"):
+        _, _, _, epct = get_disk("/boot/efi")
+        efi_col = pct_color(epct)
+        efi_str = f" · EFI: {efi_col}{epct:.0f}%{RESET}"
+
+    rows = [
+        f"{CYAN}{title}{RESET}  {DIM}({RESET}{WHITE}{user}{RESET}{DIM} @ {RESET}{CYAN}{host}{RESET}{DIM}){RESET}",
+        f"{DIM}{'─' * 52}{RESET}",
+        f"{WHITE}Datum    {RESET}: {now}",
+        f"{WHITE}Kernel   {RESET}: {kernel} {DIM}({RESET}{taint_str}{DIM}){RESET}",
+        f"{WHITE}Boot     {RESET}: {get_boot_status()}",
+        f"{WHITE}Uptime   {RESET}: {get_uptime()}",
+        f"{WHITE}IP       {RESET}: {get_ip()}",
+        f"{WHITE}CPU      {RESET}: {bar(cpu_pct)} {pct_color(cpu_pct)}{cpu_pct:4.1f}%{RESET} {DIM}({ncpu} cores{temp}){RESET}",
+        f"{WHITE}RAM      {RESET}: {bar(mpct)} {pct_color(mpct)}{mpct:4.1f}%{RESET} ({fmt_bytes(mused)} / {fmt_bytes(mtot)}) · {swap_str}",
+        f"{WHITE}Schijf / {RESET}: {bar(dpct)} {pct_color(dpct)}{dpct:4.1f}%{RESET} ({fmt_bytes(dused)} / {fmt_bytes(dtot)}){efi_str}",
+        f"{WHITE}Systeem  {RESET}: {get_services_and_extras()}",
+        f"{WHITE}Sessie   {RESET}: {sess_str}",
+    ]
+    last_log = get_last_login()
+    if last_log:
+        rows.append(f"{WHITE}Laatste  {RESET}: {DIM}{last_log}{RESET}")
+
+    buf = []
+    if clear_screen:
+        buf.append("\x1b[H\x1b[2J")
+    buf.append("")
+    total = max(len(logo), len(rows))
+    pad_left = " " * 30
+    for i in range(total):
+        left = logo[i] if i < len(logo) else pad_left
+        right = rows[i] if i < len(rows) else ""
+        buf.append(f"{left}    {right}")
+    buf.append("")
+    sys.stdout.write("\n".join(buf) + "\n")
+    sys.stdout.flush()
+    return next_cpu
+
+
+def main():
+    args = sys.argv[1:]
+    watch = ("--watch" in args) or ("-w" in args) or ("live" in args)
+    do_clear = ("--clear" in args) or watch
+
+    if watch:
+        sys.stdout.write("\x1b[?25l")
+        prev = read_cpu_sample()
+        time.sleep(0.30)
+        try:
+            while True:
+                prev = render(prev_cpu=prev, clear_screen=True)
+                sys.stdout.write(f"  {DIM}[Live modus — ververst elke 1s · druk Ctrl+C om te stoppen]{RESET}\n")
+                sys.stdout.flush()
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            sys.stdout.write("\x1b[?25h\n")
+            sys.stdout.flush()
+    else:
+        render(prev_cpu=None, clear_screen=do_clear)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,14 @@
+[Unit]
+Description=KaaijkOS Compressed ZRAM Swap (zstd)
+DefaultDependencies=no
+Before=swap.target systemd-oomd.service
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/kaaijkos-zram start
+ExecStop=/usr/bin/kaaijkos-zram stop
+
+[Install]
+WantedBy=swap.target

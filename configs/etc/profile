@@ -3,3 +3,7 @@ export LANG=en_US.UTF-8
 export EDITOR=nano
 export PAGER=less
 [ -f /etc/bash.bashrc ] && . /etc/bash.bashrc
+for _f in /etc/profile.d/*.sh; do
+    [ -r "$_f" ] && . "$_f"
+done
+unset _f

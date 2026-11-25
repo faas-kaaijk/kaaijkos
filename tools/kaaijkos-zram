@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# KaaijkOS 1.1 — Dynamische zstd-gecomprimeerde ZRAM swap (50% fysiek RAM, 512 MiB - 4 GiB)
+set -euo pipefail
+
+case "${1:-start}" in
+    start)
+        modprobe zram
+        [ -b /dev/zram0 ] || exit 1
+        grep -q '^/dev/zram0 ' /proc/swaps && exit 0
+        MEM_KB=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
+        # 50% van fysiek RAM, minimaal 512 MiB, maximaal 4 GiB
+        ZRAM_BYTES=$(( (MEM_KB / 2) * 1024 ))
+        [ "$ZRAM_BYTES" -lt 536870912 ]  && ZRAM_BYTES=536870912
+        [ "$ZRAM_BYTES" -gt 4294967296 ] && ZRAM_BYTES=4294967296
+        echo 1 > /sys/block/zram0/reset 2>/dev/null || true
+        echo zstd > /sys/block/zram0/comp_algorithm 2>/dev/null || true
+        echo "$ZRAM_BYTES" > /sys/block/zram0/disksize
+        mkswap -L KAAIJKOS_ZRAM /dev/zram0 >/dev/null
+        swapon -p 100 /dev/zram0
+        ;;
+    stop)
+        swapoff /dev/zram0 2>/dev/null || true
+        echo 1 > /sys/block/zram0/reset 2>/dev/null || true
+        ;;
+    *)
+        echo "Gebruik: $0 {start|stop}" >&2
+        exit 1
+        ;;
+esac
